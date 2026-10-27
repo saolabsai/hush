@@ -1,5 +1,5 @@
-//! Stateful mono, full-band speech enhancement backed by the authors' DFN3 runtime.
-//! Each input stream must own a separate instance. Input/output are normalized PCM.
+//! Stateful mono speech enhancement backed by the authors' pretrained DFN3 runtime.
+//! Each input stream owns its model and resampling state. Audio is normalized PCM.
 use anyhow::{ensure, Context, Result};
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{ArrayView2, ArrayViewMut2};
@@ -31,6 +31,7 @@ struct TelephoneStream {
 }
 
 impl StreamDenoiser {
+    /// Construct off the audio thread. The model always runs internally at 48 kHz.
     pub fn new(sample_rate: u32, atten_lim_db: f32) -> Result<Self> {
         ensure!(
             matches!(sample_rate, TELEPHONY_SAMPLE_RATE | SAMPLE_RATE),
@@ -68,6 +69,7 @@ impl StreamDenoiser {
         self.sample_rate as usize / 100
     }
 
+    /// Alignment delay in interface samples: 304 at 8 kHz, 1,440 at 48 kHz.
     pub fn delay_samples(&self) -> usize {
         if self.telephone.is_some() {
             self.model.delay_samples() / RATIO + CONVERSION_DELAY_SAMPLES
