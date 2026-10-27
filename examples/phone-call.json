@@ -1,0 +1,6 @@
+{
+  "profile": "phone_call",
+  "sample_rate": 8000,
+  "atten_lim_db": 24,
+  "enabled": true
+}

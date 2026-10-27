@@ -9,7 +9,8 @@ const ui = Object.fromEntries([
   'cleaned-player', 'original-waveform', 'cleaned-waveform', 'original-placeholder',
   'cleaned-placeholder', 'original-duration', 'result-pill', 'download-link',
   'switch-original', 'switch-cleaned', 'metrics', 'metric-duration', 'metric-inference',
-  'metric-rtf', 'metrics-note',
+  'metric-rtf', 'metrics-note', 'profile', 'sample-rate', 'enabled',
+  'attenuation-number', 'config-preview', 'copy-config',
 ].map((id) => [id, $(id)]));
 
 const state = {
@@ -17,6 +18,7 @@ const state = {
   source: null, sourceUrl: null, resultUrl: null, result: null,
   originalPeaks: null, cleanedPeaks: null, recorder: null,
   token: 0, playing: null, animation: null, unloaded: false,
+  profiles: {}, profile: null, settings: null, originalSource: null,
 };
 
 function message(text) { ui.activity.textContent = text; }
@@ -38,17 +40,87 @@ function updateControls() {
   ui['file-input'].disabled = !state.ready || !idle;
   ui['upload-label'].setAttribute('aria-disabled', String(ui['file-input'].disabled));
   ui.attenuation.disabled = !state.ready || !idle;
-  ui['enhance-button'].disabled = !state.ready || !idle || !state.source;
+  for (const id of ['profile', 'sample-rate', 'enabled', 'attenuation-number', 'copy-config']) ui[id].disabled = !state.ready || !idle;
+  let settings = null;
+  try { settings = readSettings(); } catch { ui['copy-config'].disabled = true; }
+  ui['enhance-button'].disabled = !state.ready || !idle || !state.source || !settings || state.source.sampleRate !== settings.sample_rate;
   ui['switch-original'].disabled = !idle || !state.result;
   ui['switch-cleaned'].disabled = !idle || !state.result;
   ui['record-button'].classList.toggle('recording', recording);
   ui['record-label'].textContent = recording ? 'Recording… click to stop' : state.mode === 'preparing' ? 'Opening your microphone…' : 'Record a clip';
   ui['record-hint'].textContent = recording ? 'Speak naturally. Add a little background noise.' : `Use your microphone · up to ${state.maxDuration} seconds`;
   if (!recording) ui['record-action'].textContent = '↗';
-  ui['enhance-label'].textContent = state.mode === 'processing' ? 'Cleaning up audio…' : 'Clean up audio';
+  ui['enhance-label'].textContent = state.mode === 'processing' ? 'Processing audio…' : ui.enabled.checked ? 'Clean up audio' : 'Process without reduction';
   ui['enhance-arrow'].textContent = state.mode === 'processing' ? '···' : '↗';
 }
 function setMode(mode) { state.mode = mode; updateControls(); }
+
+function validateSettings(settings) {
+  if (![8000, 16000, 48000].includes(settings.sample_rate)) throw new Error('Choose 8, 16 or 48 kHz audio.');
+  if (!Number.isFinite(settings.atten_lim_db) || settings.atten_lim_db < 0 || settings.atten_lim_db > 100) throw new Error('Noise reduction must be between 0 and 100 dB.');
+  if (typeof settings.enabled !== 'boolean') throw new Error('Enabled must be a boolean.');
+  return { sample_rate: settings.sample_rate, atten_lim_db: settings.atten_lim_db, enabled: settings.enabled };
+}
+function readSettings() {
+  const limit = ui['attenuation-number'].value.trim();
+  if (!limit) throw new Error('Enter a noise reduction limit from 0 to 100 dB.');
+  return validateSettings({ sample_rate: Number(ui['sample-rate'].value), atten_lim_db: Number(limit), enabled: ui.enabled.checked });
+}
+function writeSettings(settings) {
+  ui['sample-rate'].value = String(settings.sample_rate);
+  ui.attenuation.value = String(settings.atten_lim_db);
+  ui['attenuation-number'].value = String(settings.atten_lim_db);
+  ui.enabled.checked = settings.enabled;
+  ui['attenuation-value'].textContent = `${settings.atten_lim_db} dB`;
+}
+function renderConfiguration() {
+  try { ui['config-preview'].textContent = JSON.stringify(readSettings(), null, 2); }
+  catch { ui['config-preview'].textContent = 'Enter valid settings to build the configuration.'; }
+}
+async function changeSettings() {
+  if (state.mode !== 'idle') return;
+  clearError(); clearResult();
+  let next;
+  try { next = readSettings(); }
+  catch (error) { renderConfiguration(); updateControls(); showError(error); return; }
+  ui['attenuation-value'].textContent = `${next.atten_lim_db} dB`;
+  renderConfiguration();
+  const previous = state.settings, previousProfile = state.profile;
+  if (state.source && state.source.sampleRate !== next.sample_rate) {
+    const token = ++state.token;
+    ui['original-player'].pause();
+    setMode('converting'); message('Preparing the original audio at the selected rate…');
+    try {
+      if (!state.originalSource) throw new Error('Reload this clip before changing its sample rate.');
+      await applyOriginalSource(state.originalSource, next.sample_rate, token);
+      if (state.token !== token || state.unloaded) return;
+    } catch (error) {
+      if (previous) writeSettings(previous);
+      ui.profile.value = previousProfile;
+      renderConfiguration(); showError(error); message('Your previous clip and settings are still available.');
+      return;
+    } finally { if (state.token === token && !state.unloaded) setMode('idle'); }
+  }
+  state.settings = next;
+  state.profile = ui.profile.value;
+  message(state.source ? 'Settings updated. Process the clip again to compare.' : 'Select a clip to test these settings.');
+  updateControls();
+}
+async function applyProfile() {
+  if (state.mode !== 'idle') return;
+  const defaults = state.profiles[ui.profile.value];
+  if (!defaults) return;
+  writeSettings(defaults);
+  await changeSettings();
+}
+async function copyConfiguration() {
+  try {
+    const text = JSON.stringify(readSettings(), null, 2);
+    if (!navigator.clipboard?.writeText) throw new Error('Select and copy the JSON below; clipboard access is unavailable.');
+    await navigator.clipboard.writeText(text);
+    message('Configuration copied. Use it with HushConfig.from_dict().');
+  } catch (error) { showError(error); }
+}
 
 function resetPlayer(player) {
   player.pause();
@@ -76,19 +148,56 @@ function clearResult() {
   drawWaveforms();
 }
 
-function createWav(samples) {
+function createWav(samples, sampleRate = 48000) {
   const bytes = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(bytes);
   function write(offset, text) { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); }
   write(0, 'RIFF'); view.setUint32(4, bytes.byteLength - 8, true); write(8, 'WAVE');
   write(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true); view.setUint32(24, 48000, true); view.setUint32(28, 96000, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, 'data'); view.setUint32(40, samples.length * 2, true);
   for (let i = 0; i < samples.length; i++) {
     const sample = Math.max(-1, Math.min(1, samples[i]));
     view.setInt16(44 + i * 2, Math.round(sample < 0 ? sample * 32768 : sample * 32767), true);
   }
   return new Blob([bytes], { type: 'audio/wav' });
+}
+
+function parseNativeWav(bytes) {
+  const view = new DataView(bytes);
+  const text = (offset, size) => String.fromCharCode(...new Uint8Array(bytes, offset, size));
+  if (view.byteLength < 12 || text(0, 4) !== 'RIFF' || text(8, 4) !== 'WAVE') return null;
+  const end = view.getUint32(4, true) + 8;
+  if (end < 12 || end > view.byteLength) throw new Error('The WAV file is incomplete. Please choose a complete recording.');
+  let format = null, data = null;
+  for (let offset = 12; offset < end;) {
+    if (offset + 8 > end) throw new Error('The WAV contains an incomplete chunk header.');
+    const kind = text(offset, 4), size = view.getUint32(offset + 4, true);
+    const start = offset + 8, next = start + size + (size % 2);
+    if (next > end) throw new Error('The WAV contains an incomplete chunk or missing padding.');
+    if (kind === 'fmt ') {
+      if (format || size < 16) throw new Error('The WAV format chunk is invalid.');
+      format = {
+        codec: view.getUint16(start, true), channels: view.getUint16(start + 2, true),
+        sampleRate: view.getUint32(start + 4, true), byteRate: view.getUint32(start + 8, true),
+        blockAlign: view.getUint16(start + 12, true), bits: view.getUint16(start + 14, true),
+      };
+    } else if (kind === 'data') {
+      if (!format) throw new Error('The WAV audio data appears before its format chunk.');
+      if (data) throw new Error('The WAV contains multiple audio data chunks.');
+      data = { start, size };
+    }
+    offset = next;
+  }
+  if (!format || !data) throw new Error('The WAV is missing its format or audio data chunk.');
+  if (format.codec !== 1 || format.channels !== 1 || format.bits !== 16 || ![8000, 16000, 48000].includes(format.sampleRate)) return null;
+  if (format.blockAlign !== 2 || format.byteRate !== format.sampleRate * 2 || data.size % 2) throw new Error('The WAV contains invalid PCM16 framing.');
+  if (!data.size) throw new Error('The audio file is empty. Please choose a clip with some sound.');
+  const count = data.size / 2;
+  if (count > state.maxDuration * format.sampleRate) throw new Error(`Please choose a clip of ${state.maxDuration} seconds or less.`);
+  const samples = new Float32Array(count);
+  for (let index = 0; index < count; index++) samples[index] = view.getInt16(data.start + index * 2, true) / 32768;
+  return { samples, sampleRate: format.sampleRate, blob: new Blob([bytes], { type: 'audio/wav' }) };
 }
 
 async function decodeAudio(bytes) {
@@ -100,7 +209,7 @@ async function decodeAudio(bytes) {
   finally { await context.close(); }
 }
 
-async function prepareMono(buffer) {
+function readMono(buffer) {
   if (!buffer.length || !Number.isFinite(buffer.duration)) throw new Error('The audio file is empty. Please choose a clip with some sound.');
   if (buffer.duration > state.maxDuration + 0.001) throw new Error(`This clip is ${buffer.duration.toFixed(1)} seconds long. Please choose a clip of ${state.maxDuration} seconds or less.`);
   // Explicit averaging makes multichannel conversion predictable (including stereo).
@@ -109,15 +218,26 @@ async function prepareMono(buffer) {
     const samples = buffer.getChannelData(channel);
     for (let frame = 0; frame < mono.length; frame++) mono[frame] += samples[frame] / buffer.numberOfChannels;
   }
-  if (buffer.sampleRate === 48000) return mono;
+  return { samples: mono, sampleRate: buffer.sampleRate, blob: null };
+}
+
+async function resampleMono(samples, inputRate, outputRate) {
+  if (inputRate === outputRate) return samples;
   const OfflineContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   if (!OfflineContext) throw new Error('This browser cannot prepare the audio. Please use a recent Chrome, Edge, Firefox, or Safari browser.');
-  const frames = Math.min(state.maxDuration * 48000, Math.round(mono.length * 48000 / buffer.sampleRate));
-  const context = new OfflineContext(1, frames, 48000);
-  const input = context.createBuffer(1, mono.length, buffer.sampleRate);
-  input.copyToChannel(mono, 0);
+  const frames = Math.max(1, Math.round(samples.length * outputRate / inputRate));
+  const context = new OfflineContext(1, frames, outputRate);
+  const input = context.createBuffer(1, samples.length, inputRate);
+  input.copyToChannel(samples, 0);
   const source = context.createBufferSource(); source.buffer = input; source.connect(context.destination); source.start();
   return (await context.startRendering()).getChannelData(0).slice();
+}
+
+async function applyOriginalSource(original, sampleRate, token) {
+  const samples = await resampleMono(original.samples, original.sampleRate, sampleRate);
+  if (state.token !== token || state.unloaded) return;
+  state.originalSource = original;
+  setSource(samples, original.name, original.description, sampleRate, original.sampleRate === sampleRate ? original.blob : null);
 }
 
 function makePeaks(samples, bins = 720) {
@@ -164,12 +284,12 @@ function animateWaveforms() {
   draw();
 }
 
-function setSource(samples, name, description) {
+function setSource(samples, name, description, sampleRate = 48000, rawBlob = null) {
   clearResult();
   resetPlayer(ui['original-player']);
   state.playing = null;
   if (state.sourceUrl) URL.revokeObjectURL(state.sourceUrl);
-  state.source = { blob: createWav(samples), duration: samples.length / 48000, name };
+  state.source = { blob: rawBlob || createWav(samples, sampleRate), duration: samples.length / sampleRate, sampleRate, name };
   state.sourceUrl = URL.createObjectURL(state.source.blob);
   state.originalPeaks = makePeaks(samples);
   ui['original-player'].src = state.sourceUrl;
@@ -178,7 +298,7 @@ function setSource(samples, name, description) {
   ui['original-duration'].textContent = timeLabel(state.source.duration);
   ui['source-name'].textContent = name;
   ui['source-name'].title = name;
-  ui['source-detail'].textContent = `${state.source.duration.toFixed(1)} sec · ${description} · mono 48 kHz`;
+  ui['source-detail'].textContent = `${state.source.duration.toFixed(1)} sec · ${description} · mono ${sampleRate / 1000} kHz`;
   ui['source-check'].hidden = false;
   message('Ready when you are. Clean up the clip, then compare A and B.');
   drawWaveforms(); updateControls();
@@ -205,9 +325,9 @@ async function loadAudio(source) {
       if (source.size > 64 * 1024 * 1024) throw new Error('This file is too large. Choose a WAV file smaller than 64 MB and up to 60 seconds long.');
       bytes = await source.arrayBuffer(); name = source.name; description = 'uploaded clip';
     }
-    const samples = await prepareMono(await decodeAudio(bytes));
-    if (state.token !== token || state.unloaded) return;
-    setSource(samples, name, description);
+    const native = parseNativeWav(bytes);
+    const original = native || readMono(await decodeAudio(bytes));
+    await applyOriginalSource({ ...original, name, description }, Number(ui['sample-rate'].value), token);
   } catch (error) { if (state.token === token) { showError(error); message(state.source ? 'Your previous clip is still available.' : 'Choose another clip to get started.'); } }
   finally { if (state.token === token && !state.unloaded) setMode('idle'); ui['file-input'].value = ''; }
 }
@@ -217,21 +337,24 @@ async function enhance() {
   clearError();
   ui['original-player'].pause(); clearResult();
   const token = ++state.token;
-  const attenuation = Number(ui.attenuation.value);
+  let settings;
+  try { settings = readSettings(); }
+  catch (error) { showError(error); updateControls(); return; }
   const source = state.source;
+  if (source.sampleRate !== settings.sample_rate) { showError('Prepare the clip at the selected sample rate before processing.'); return; }
   setMode('processing');
   message('The audio engine is working. The first run can take a moment to initialize.');
   ui['result-pill'].textContent = 'PROCESSING';
   ui['cleaned-placeholder'].textContent = 'Finding a little more clarity…';
   try {
-    const response = await fetch(`/api/enhance?attenuation=${attenuation}`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: source.blob });
+    const response = await fetch(`/api/enhance?attenuation=${settings.atten_lim_db}&enabled=${settings.enabled}&sample_rate=${settings.sample_rate}`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: source.blob });
     if (!response.ok) throw new Error(await readError(response));
     const bytes = await response.arrayBuffer();
     const decoded = await decodeAudio(bytes.slice(0));
     if (state.token !== token || state.unloaded) return;
     const blob = new Blob([bytes], { type: 'audio/wav' });
     state.resultUrl = URL.createObjectURL(blob);
-    state.result = { attenuation };
+    state.result = { attenuation: settings.atten_lim_db, enabled: settings.enabled, sampleRate: settings.sample_rate };
     state.cleanedPeaks = makePeaks(decoded.getChannelData(0));
     ui['cleaned-player'].src = state.resultUrl;
     ui['cleaned-player'].classList.add('has-source');
@@ -239,7 +362,7 @@ async function enhance() {
     ui['download-link'].href = state.resultUrl;
     ui['download-link'].download = `${source.name.replace(/\.wav$/i, '').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 90) || 'recording'}-cleaned.wav`;
     ui['download-link'].setAttribute('aria-disabled', 'false');
-    ui['result-pill'].textContent = `${attenuation} dB LIMIT`;
+    ui['result-pill'].textContent = settings.enabled ? `${settings.atten_lim_db} dB LIMIT` : 'BYPASS';
     ui['result-pill'].classList.add('done');
     const metric = (header) => { const value = response.headers.get(header); return value === null || value.trim() === '' ? null : Number(value); };
     const duration = metric('X-Audio-Duration'), inference = metric('X-Inference-Ms'), rtf = metric('X-Real-Time-Factor'), total = metric('X-Processing-Ms');
@@ -277,7 +400,8 @@ async function finishRecording(recorder) {
     for (const chunk of recorder.chunks) { samples.set(chunk, offset); offset += chunk.length; }
     const buffer = new AudioBuffer({ length, numberOfChannels: 1, sampleRate: recorder.sampleRate });
     buffer.copyToChannel(samples, 0);
-    setSource(await prepareMono(buffer), 'Microphone recording', 'recorded just now');
+    const original = { ...readMono(buffer), name: 'Microphone recording', description: 'recorded just now' };
+    await applyOriginalSource(original, Number(ui['sample-rate'].value), state.token);
   } catch (error) { showError(error); message('The recording could not be prepared. Please try again.'); }
   finally { if (state.recorder === recorder) state.recorder = null; if (!state.unloaded) setMode('idle'); }
 }
@@ -376,7 +500,12 @@ ui['demo-button'].addEventListener('click', () => loadAudio('demo'));
 ui['file-input'].addEventListener('change', () => { if (ui['file-input'].files[0]) loadAudio(ui['file-input'].files[0]); });
 ui['enhance-button'].addEventListener('click', enhance);
 ui['record-button'].addEventListener('click', () => state.mode === 'recording' ? stopRecording() : startRecording());
-ui.attenuation.addEventListener('input', () => { ui['attenuation-value'].textContent = `${ui.attenuation.value} dB`; if (state.result && Number(ui.attenuation.value) !== state.result.attenuation) message(`The current result uses ${state.result.attenuation} dB. Clean up audio again to apply ${ui.attenuation.value} dB.`); else if (state.result) message('Your comparison is ready. Switch between A and B at the same point in the clip.'); });
+ui.profile.addEventListener('change', applyProfile);
+ui['sample-rate'].addEventListener('change', changeSettings);
+ui.enabled.addEventListener('change', changeSettings);
+ui.attenuation.addEventListener('input', () => { ui.attenuation.value = String(Math.round(Number(ui.attenuation.value) * 10) / 10); ui['attenuation-number'].value = ui.attenuation.value; changeSettings(); });
+ui['attenuation-number'].addEventListener('input', () => { if (ui['attenuation-number'].value.trim()) ui.attenuation.value = ui['attenuation-number'].value; changeSettings(); });
+ui['copy-config'].addEventListener('click', copyConfiguration);
 ui['switch-original'].addEventListener('click', () => switchPlayback(ui['original-player']));
 ui['switch-cleaned'].addEventListener('click', () => switchPlayback(ui['cleaned-player']));
 for (const name of ['original', 'cleaned']) {
@@ -402,15 +531,23 @@ async function initialize() {
     const status = await response.json();
     state.ready = Boolean(status.ready);
     state.demoAvailable = Boolean(status.demo_available);
+    for (const name of ['phone_call', 'video_interview']) {
+      if (!status.profiles || !status.profiles[name]) throw new Error('The settings catalog is unavailable. Update and restart the lab server.');
+      state.profiles[name] = validateSettings(status.profiles[name]);
+    }
+    ui.profile.value = 'phone_call';
+    writeSettings(state.profiles.phone_call);
+    state.profile = 'phone_call'; state.settings = { ...state.profiles.phone_call };
+    renderConfiguration();
     if (Number.isFinite(status.max_duration_seconds)) state.maxDuration = status.max_duration_seconds;
-    if (Number.isFinite(status.default_attenuation_db)) { ui.attenuation.value = status.default_attenuation_db; ui['attenuation-value'].textContent = `${ui.attenuation.value} dB`; }
     ui['engine-dot'].className = `status-dot ${state.ready ? 'ready' : 'error'}`;
     ui['engine-status'].textContent = state.ready ? 'Engine ready for a listening test' : 'Engine is not ready';
     if (!state.ready) { showError(status.error || 'The noise suppression engine is unavailable. Please try again later.'); message('Refresh once the engine is ready.'); }
   } catch (error) {
+    state.ready = false;
     ui['engine-dot'].className = 'status-dot error'; ui['engine-status'].textContent = 'Cannot connect to the audio engine';
     showError(error); message('Check your connection, then refresh this page.');
   }
   updateControls();
 }
-initialize();
+const initialized = initialize();

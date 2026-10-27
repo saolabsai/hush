@@ -61,6 +61,75 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                          [2880, 2880, 2880, 2880, 3840])
         self.assertEqual(output, wet(audio))
 
+    async def test_phone_packets_return_without_waiting_for_four_hops(self):
+        client = self.client()
+        await client.start(8000)
+        self.assertEqual(client.stream_info.sample_rate, 8000)
+        self.assertEqual(client.stream_info.frame_samples, 80)
+        self.assertEqual(client.stream_info.model_sample_rate, 48000)
+        packet = b"\x12\x34" * 160
+        with patch.object(client, "_exchange", wraps=client._exchange) as exchange:
+            for _ in range(5):
+                self.assertEqual(await asyncio.wait_for(client.process(packet), 2), wet(packet))
+        self.assertEqual([len(call.args[0]) for call in exchange.await_args_list], [320] * 5)
+
+    async def test_phone_large_fragmented_input_stays_bounded_and_ordered(self):
+        client = self.client()
+        await client.start(8000)
+        audio = bytes(range(256)) * 125
+        output = bytearray()
+        offset = 0
+        with patch.object(client, "_exchange", wraps=client._exchange) as exchange:
+            for length in (2, 62, 258, 318, 2048, 1198):
+                output.extend(await client.process(audio[offset:offset + length]))
+                offset += length
+            output.extend(await client.process(audio[offset:]))
+        self.assertEqual(output, wet(audio))
+        sizes = [len(call.args[0]) for call in exchange.await_args_list]
+        self.assertTrue(all(0 < size <= 640 and size % 160 == 0 for size in sizes))
+        self.assertIn(640, sizes)
+
+    async def test_phone_modes_keep_sample_positions_across_partial_hops(self):
+        client = self.client("delay")
+        await client.start(8000)
+        expected = bytearray(client.stream_info.algorithmic_delay_samples * 2)
+        output = bytearray()
+        segments = [(True, b"\x01\x00" * 37), (False, b"\x02\x00" * 243),
+                    (True, b"\x03\x00" * 161), (False, b"\x04\x00" * 279),
+                    (True, bytes(480))]
+        for enabled, segment in segments:
+            await client.set_enabled(enabled)
+            expected.extend(wet(segment) if enabled else segment)
+            output.extend(await client.process(segment))
+        self.assertEqual(output, expected[:len(output)])
+        self.assertEqual(len(output), sum(len(segment) for _, segment in segments))
+
+    async def test_restart_can_change_rate_without_old_audio_or_mode(self):
+        client = self.client()
+        await client.start(8000)
+        await client.set_enabled(False)
+        self.assertEqual(await client.process(b"\x12\x34" * 100), b"\x12\x34" * 80)
+        await client.stop()
+        await client.start(48000)
+        self.assertTrue(client.enabled)
+        self.assertEqual(client.stream_info.sample_rate, 48000)
+        self.assertEqual(await client.process(bytes(960)), wet(bytes(960)))
+
+    async def test_phone_rejects_worker_running_at_a_different_rate(self):
+        client = self.client("wrong_rate")
+        with self.assertRaisesRegex(DenoiserError, "sample_rate"):
+            await client.start(8000)
+        self.assertFalse(client.running)
+        self.assertIsNone(client._process)
+
+    async def test_unsupported_or_ambiguous_rates_do_not_spawn(self):
+        client = self.client()
+        with patch("asyncio.create_subprocess_exec") as spawn:
+            for rate in (8, 22050, 44100, 8000.0, True, "8000"):
+                with self.subTest(rate=rate), self.assertRaisesRegex(ValueError, "8000, 16000 or 48000"):
+                    await client.start(rate)
+            spawn.assert_not_called()
+
     async def test_batched_and_fragmented_toggles_have_identical_delayed_audio(self):
         batched, fragmented = self.client("delay"), self.client("delay")
         await asyncio.gather(batched.start(), fragmented.start())
@@ -111,7 +180,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "start"):
             await client.set_enabled(False)
         with self.assertRaisesRegex(ValueError, "48000"):
-            await client.start(16000)
+            await client.start(44100)
         await client.start()
         with self.assertRaisesRegex(RuntimeError, "already"):
             await client.start()
@@ -244,6 +313,19 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                 data = valid | {key: value}
                 with self.assertRaises(ValueError):
                     RustDenoiser._parse_header(json.dumps(data).encode() + b"\n")
+
+    def test_phone_metadata_uses_interface_samples_and_the_48k_model(self):
+        import json
+        valid = dict(protocol=1, sample_rate=8000, frame_samples=80,
+                     algorithmic_delay_samples=304, model="DeepFilterNet3", model_sample_rate=48000)
+        info = RustDenoiser._parse_header(json.dumps(valid).encode() + b"\n", 8000)
+        self.assertEqual((info.sample_rate, info.frame_samples, info.algorithmic_delay_samples),
+                         (8000, 80, 304))
+        for key, value in [("sample_rate", 48000), ("sample_rate", 8000.0),
+                           ("frame_samples", 480), ("algorithmic_delay_samples", 8001),
+                           ("model_sample_rate", 8000), ("model_sample_rate", True)]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                RustDenoiser._parse_header(json.dumps(valid | {key: value}).encode() + b"\n", 8000)
 
 
 if __name__ == "__main__":

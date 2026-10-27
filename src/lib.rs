@@ -1,14 +1,124 @@
-//! Stateful mono, full-band speech enhancement backed by the authors' DFN3 runtime.
-//! Each input stream must own a separate instance. Input/output are normalized PCM.
+//! Stateful mono speech enhancement backed by the authors' pretrained DFN3 runtime.
+//! Each input stream owns its model and resampling state. Audio is normalized PCM.
 use anyhow::{ensure, Context, Result};
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{ArrayView2, ArrayViewMut2};
 
+mod telephony;
+use telephony::{TelephoneResampler, CONVERSION_DELAY_SAMPLES};
+
 pub const SAMPLE_RATE: u32 = 48_000;
+pub const TELEPHONY_SAMPLE_RATE: u32 = 8_000;
+pub const WIDEBAND_SAMPLE_RATE: u32 = 16_000;
 
 /// A single speech stream. The underlying runtime retains recurrent and DSP state.
 pub struct Denoiser {
     model: DfTract,
+}
+
+/// A 10 ms mono stream at 8, 16 or 48 kHz, with independent model and conversion state.
+pub struct StreamDenoiser {
+    model: Denoiser,
+    sample_rate: u32,
+    telephone: Option<TelephoneStream>,
+}
+
+struct TelephoneStream {
+    resampler: TelephoneResampler,
+    input: [f32; 480],
+    output: [f32; 480],
+    dry: Option<Vec<f32>>,
+    dry_head: usize,
+}
+
+impl StreamDenoiser {
+    /// Construct off the audio thread. The model always runs internally at 48 kHz.
+    pub fn new(sample_rate: u32, atten_lim_db: f32) -> Result<Self> {
+        ensure!(
+            matches!(
+                sample_rate,
+                TELEPHONY_SAMPLE_RATE | WIDEBAND_SAMPLE_RATE | SAMPLE_RATE
+            ),
+            "supported sample rates are 8000, 16000 and 48000 Hz"
+        );
+        let model = Denoiser::new(atten_lim_db)?;
+        let telephone = if sample_rate != SAMPLE_RATE {
+            let ratio = (SAMPLE_RATE / sample_rate) as usize;
+            ensure!(
+                model.delay_samples() % ratio == 0,
+                "model delay is not integral at {sample_rate} Hz"
+            );
+            let delay = model.delay_samples() / ratio + CONVERSION_DELAY_SAMPLES;
+            Some(TelephoneStream {
+                resampler: TelephoneResampler::new(ratio),
+                input: [0.0; 480],
+                output: [0.0; 480],
+                dry: (atten_lim_db == 0.0).then(|| vec![0.0; delay]),
+                dry_head: 0,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            model,
+            sample_rate,
+            telephone,
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn frame_samples(&self) -> usize {
+        self.sample_rate as usize / 100
+    }
+
+    /// Alignment delay in interface samples: 304 at 8 kHz, 544 at 16 kHz, 1,440 at 48 kHz.
+    pub fn delay_samples(&self) -> usize {
+        if self.telephone.is_some() {
+            self.model.delay_samples() / (SAMPLE_RATE / self.sample_rate) as usize
+                + CONVERSION_DELAY_SAMPLES
+        } else {
+            self.model.delay_samples()
+        }
+    }
+
+    pub fn process_frame(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        let hop = self.frame_samples();
+        ensure!(
+            input.len() == hop && output.len() == hop,
+            "expected {hop} samples per frame"
+        );
+        ensure!(
+            input.iter().all(|v| v.is_finite() && v.abs() <= 1.0),
+            "input must be finite normalized PCM in [-1, 1]"
+        );
+        if let Some(telephone) = &mut self.telephone {
+            telephone.resampler.upsample(input, &mut telephone.input);
+            // Band-limited interpolation can overshoot full-scale transients.
+            for sample in &mut telephone.input {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+            self.model
+                .process_frame(&telephone.input, &mut telephone.output)?;
+            telephone.resampler.downsample(&telephone.output, output);
+            ensure!(
+                output.iter().all(|v| v.is_finite()),
+                "resampler produced non-finite output"
+            );
+            if let Some(dry) = &mut telephone.dry {
+                for (&sample, destination) in input.iter().zip(output) {
+                    *destination = dry[telephone.dry_head];
+                    dry[telephone.dry_head] = sample;
+                    telephone.dry_head = (telephone.dry_head + 1) % dry.len();
+                }
+            }
+            Ok(())
+        } else {
+            self.model.process_frame(input, output)
+        }
+    }
 }
 
 impl Denoiser {
@@ -67,6 +177,186 @@ impl Denoiser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_sample_rates_are_explicit_and_validated_before_model_loading() {
+        for rate in [0, 8, 11_025, 44_100, 96_000] {
+            assert!(StreamDenoiser::new(rate, 24.0).is_err());
+        }
+    }
+
+    #[test]
+    fn telephone_framing_validation_silence_and_stream_state() -> Result<()> {
+        let mut actual = StreamDenoiser::new(8_000, 24.0)?;
+        let mut fresh = StreamDenoiser::new(8_000, 24.0)?;
+        assert_eq!(actual.sample_rate(), 8_000);
+        assert_eq!(actual.frame_samples(), 80);
+        assert_eq!(actual.delay_samples(), 304);
+        let mut output = [0.0; 80];
+        let mut expected = [0.0; 80];
+        assert!(actual.process_frame(&[0.0; 79], &mut output).is_err());
+        assert!(actual.process_frame(&[f32::NAN; 80], &mut output).is_err());
+        assert!(actual
+            .process_frame(&[f32::INFINITY; 80], &mut output)
+            .is_err());
+        assert!(actual.process_frame(&[1.1; 80], &mut output).is_err());
+        for _ in 0..5 {
+            actual.process_frame(&[0.0; 80], &mut output)?;
+            fresh.process_frame(&[0.0; 80], &mut expected)?;
+            assert_eq!(output, expected);
+            assert!(output.iter().all(|v| v.abs() < 1e-7));
+        }
+        let mut energy = 0.0;
+        for frame in 0..20 {
+            let input: Vec<f32> = (0..80)
+                .map(|i| match frame {
+                    2..=4 => 0.0,
+                    5 => {
+                        if i < 40 {
+                            -1.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    _ => 0.25 * ((frame * 80 + i) as f32 * 0.3).sin(),
+                })
+                .collect();
+            actual.process_frame(&input, &mut output)?;
+            fresh.process_frame(&input, &mut expected)?;
+            assert_eq!(output, expected);
+            assert!(output.iter().all(|v| v.is_finite()));
+            energy += output.iter().map(|v| v * v).sum::<f32>();
+        }
+        assert!(energy > 0.01, "telephone-band signal was discarded");
+        Ok(())
+    }
+
+    #[test]
+    fn telephone_dry_mode_preserves_pcm_at_total_conversion_delay() -> Result<()> {
+        let mut denoiser = StreamDenoiser::new(8_000, 0.0)?;
+        let source: Vec<f32> = (0..1_600)
+            .map(|i| match i / 80 {
+                3..=6 => 0.0,
+                7 => {
+                    if i % 2 == 0 {
+                        -1.0
+                    } else {
+                        32767.0 / 32768.0
+                    }
+                }
+                _ => ((i as f32 * 0.21).sin() * 16_000.0).round() / 32768.0,
+            })
+            .collect();
+        let delay = denoiser.delay_samples();
+        let mut padded = source.clone();
+        padded.resize((source.len() + delay).div_ceil(80) * 80, 0.0);
+        let mut output = vec![0.0; padded.len()];
+        for (input, output) in padded.chunks(80).zip(output.chunks_mut(80)) {
+            denoiser.process_frame(input, output)?;
+        }
+        assert!(output[..delay].iter().all(|&v| v == 0.0));
+        assert_eq!(&output[delay..delay + source.len()], &source);
+        Ok(())
+    }
+
+    #[test]
+    fn wideband_framing_silence_validation_and_fresh_state() -> Result<()> {
+        let mut actual = StreamDenoiser::new(WIDEBAND_SAMPLE_RATE, 24.0)?;
+        let mut fresh = StreamDenoiser::new(WIDEBAND_SAMPLE_RATE, 24.0)?;
+        assert_eq!(actual.sample_rate(), 16_000);
+        assert_eq!(actual.frame_samples(), 160);
+        assert_eq!(actual.delay_samples(), 544);
+        let mut output = [0.0; 160];
+        let mut expected = [0.0; 160];
+        assert!(actual.process_frame(&[0.0; 159], &mut output).is_err());
+        assert!(actual.process_frame(&[f32::NAN; 160], &mut output).is_err());
+        assert!(actual
+            .process_frame(&[f32::INFINITY; 160], &mut output)
+            .is_err());
+        assert!(actual.process_frame(&[1.1; 160], &mut output).is_err());
+        for _ in 0..5 {
+            actual.process_frame(&[0.0; 160], &mut output)?;
+            fresh.process_frame(&[0.0; 160], &mut expected)?;
+            assert_eq!(output, expected);
+            assert!(output.iter().all(|v| v.abs() < 1e-7));
+        }
+        let mut energy = 0.0;
+        for frame in 0..20 {
+            let input: Vec<f32> = (0..160)
+                .map(|i| match frame {
+                    2..=4 => 0.0,
+                    5 => {
+                        if i < 80 {
+                            -1.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    _ => 0.25 * ((frame * 160 + i) as f32 * 0.15).sin(),
+                })
+                .collect();
+            actual.process_frame(&input, &mut output)?;
+            fresh.process_frame(&input, &mut expected)?;
+            assert_eq!(output, expected);
+            assert!(output.iter().all(|v| v.is_finite()));
+            energy += output.iter().map(|v| v * v).sum::<f32>();
+        }
+        assert!(energy > 0.01, "wideband signal was discarded");
+        Ok(())
+    }
+
+    #[test]
+    fn wideband_dry_mode_preserves_pcm_at_total_conversion_delay() -> Result<()> {
+        let mut denoiser = StreamDenoiser::new(WIDEBAND_SAMPLE_RATE, 0.0)?;
+        let source: Vec<f32> = (0..3_200)
+            .map(|i| match i / 160 {
+                3..=6 => 0.0,
+                7 => {
+                    if i % 2 == 0 {
+                        -1.0
+                    } else {
+                        32767.0 / 32768.0
+                    }
+                }
+                _ => ((i as f32 * 0.105).sin() * 16_000.0).round() / 32768.0,
+            })
+            .collect();
+        let delay = denoiser.delay_samples();
+        let mut padded = source.clone();
+        padded.resize((source.len() + delay).div_ceil(160) * 160, 0.0);
+        let mut output = vec![0.0; padded.len()];
+        for (input, output) in padded.chunks(160).zip(output.chunks_mut(160)) {
+            denoiser.process_frame(input, output)?;
+        }
+        assert!(output[..delay].iter().all(|&v| v == 0.0));
+        assert_eq!(&output[delay..delay + source.len()], &source);
+        Ok(())
+    }
+
+    #[test]
+    fn full_band_wrapper_preserves_existing_model_samples_exactly() -> Result<()> {
+        let mut original = Denoiser::new(24.0)?;
+        let mut stream = StreamDenoiser::new(48_000, 24.0)?;
+        assert_eq!(stream.frame_samples(), original.frame_samples());
+        assert_eq!(stream.delay_samples(), original.delay_samples());
+        let mut expected = [0.0; 480];
+        let mut actual = [0.0; 480];
+        for frame in 0..8 {
+            let input: Vec<f32> = (0..480)
+                .map(|i| {
+                    if frame == 3 {
+                        0.0
+                    } else {
+                        0.3 * ((frame * 480 + i) as f32 * 0.11).sin()
+                    }
+                })
+                .collect();
+            original.process_frame(&input, &mut expected)?;
+            stream.process_frame(&input, &mut actual)?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn stft_reset_and_clone_preserve_stream_isolation() {

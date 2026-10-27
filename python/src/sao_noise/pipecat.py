@@ -7,7 +7,7 @@ from .stream import RustDenoiser
 
 
 class DeepFilterNetFilter(BaseAudioFilter):
-    """A mono, 48 kHz Pipecat filter backed by the persistent Rust worker.
+    """A mono, 8/16/48 kHz Pipecat filter backed by the persistent Rust worker.
 
     Constructor arguments are forwarded to :class:`RustDenoiser`. Create a
     separate instance per meeting microphone/participant audio stream.
@@ -30,10 +30,13 @@ class DeepFilterNetFilter(BaseAudioFilter):
     async def process_frame(self, frame: FilterControlFrame):
         if isinstance(frame, FilterEnableFrame):
             await self._denoiser.set_enabled(frame.enable)
-        elif isinstance(frame, FilterUpdateSettingsFrame) and "enabled" in frame.settings:
+        elif isinstance(frame, FilterUpdateSettingsFrame):
+            if {"sample_rate", "atten_lim_db"} & frame.settings.keys():
+                raise ValueError("sample_rate and atten_lim_db require a new filter after stopping the session")
             # Pipecat 1.12's BaseInputTransport dispatches settings updates to
             # the input filter, but does not route FilterEnableFrame to it.
-            await self._denoiser.set_enabled(frame.settings["enabled"])
+            if "enabled" in frame.settings:
+                await self._denoiser.set_enabled(frame.settings["enabled"])
 
     async def filter(self, audio: bytes) -> bytes:
         return await self._denoiser.process(audio)

@@ -9,6 +9,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -18,6 +19,9 @@ from aiohttp import web
 
 
 PROJECT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT / "python" / "src"))
+from sao_noise.config import HushConfig, PROFILE_NAMES, SUPPORTED_SAMPLE_RATES
+
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_SECONDS = 60
 MAX_BODY = 6 * 1024 * 1024
@@ -106,6 +110,8 @@ async def status(request: web.Request) -> web.Response:
         "ready": ready,
         "model": "DeepFilterNet3",
         "sample_rate": 48000,
+        "supported_sample_rates": list(SUPPORTED_SAMPLE_RATES),
+        "profiles": {name: HushConfig.for_profile(name).to_dict() for name in PROFILE_NAMES},
         "max_duration_seconds": MAX_SECONDS,
         "default_attenuation_db": 24,
         "demo_available": request.app[DEMO].is_file(),
@@ -123,21 +129,23 @@ async def demo(request: web.Request) -> web.Response:
     return web.FileResponse(request.app[DEMO], headers={"Content-Type": "audio/wav"})
 
 
-def validate_wav(data: bytes) -> int:
-    """Return the sample count after validating a bounded, complete PCM stream."""
+def validate_wav(data: bytes) -> tuple[int, int]:
+    """Return sample count and rate for a bounded, complete PCM stream."""
     try:
         with wave.open(io.BytesIO(data), "rb") as audio:
-            if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 48000, "NONE"):
-                raise ValueError("Expected mono 48 kHz PCM16 WAV. Reload the clip through this app.")
+            rate = audio.getframerate()
+            if ((audio.getnchannels(), audio.getsampwidth(), audio.getcomptype()) != (1, 2, "NONE")
+                    or rate not in SUPPORTED_SAMPLE_RATES):
+                raise ValueError("Expected mono 8, 16 or 48 kHz PCM16 WAV. Reload the clip through this app.")
             count = audio.getnframes()
-            if count > MAX_SECONDS * 48000:
+            if count > MAX_SECONDS * rate:
                 raise OverflowError("Choose a clip of 60 seconds or less.")
             if count < 1:
                 raise ValueError("The recording is empty. Record or choose a longer clip.")
             pcm = audio.readframes(count + 1)
             if len(pcm) != count * 2:
                 raise ValueError("The WAV is incomplete or contains a partial sample.")
-            return count
+            return count, rate
     except (wave.Error, EOFError) as exc:
         raise ValueError("This file is not a supported WAV recording.") from exc
 
@@ -151,6 +159,15 @@ async def enhance(request: web.Request) -> web.Response:
             raise ValueError
     except ValueError:
         return problem("Suppression strength must be a number between 0 and 100 dB.")
+    enabled_value = request.query.get("enabled", "true")
+    if enabled_value not in {"true", "false"}:
+        return problem("Enabled must be true or false.")
+    enabled = enabled_value == "true"
+    requested_rate = request.query.get("sample_rate")
+    if requested_rate is not None:
+        if requested_rate not in {str(rate) for rate in SUPPORTED_SAMPLE_RATES}:
+            return problem("Sample rate must be 8000, 16000 or 48000 Hz.")
+        requested_rate = int(requested_rate)
     if request.content_type not in {"audio/wav", "audio/x-wav", "application/octet-stream"}:
         return problem("Send the recording as an audio/wav request.", 415)
     if request.app[LOCK].locked():
@@ -163,11 +180,13 @@ async def enhance(request: web.Request) -> web.Response:
         except ConnectionResetError:
             return problem("The upload was interrupted. Try sending the recording again.", 400)
         try:
-            samples = validate_wav(data)
+            samples, sample_rate = validate_wav(data)
         except OverflowError as exc:
             return problem(str(exc), 413)
         except ValueError as exc:
             return problem(str(exc))
+        if requested_rate is not None and requested_rate != sample_rate:
+            return problem("The requested sample rate does not match the WAV header. Convert the audio first.")
         process = None
         with tempfile.TemporaryDirectory(prefix="hush-lab-") as directory:
             source = Path(directory) / "input.wav"
@@ -179,7 +198,7 @@ async def enhance(request: web.Request) -> web.Response:
                 # lose the process handle before cleanup.
                 spawn = asyncio.create_task(asyncio.create_subprocess_exec(
                     str(request.app[ENGINE]), "wav", str(source), str(target),
-                    "--atten-lim-db", str(attenuation),
+                    "--atten-lim-db", str(attenuation if enabled else 0.0),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 ))
                 try:
@@ -195,14 +214,16 @@ async def enhance(request: web.Request) -> web.Response:
                     return problem("The Rust engine could not process this recording.", 500)
                 timing = json.loads(stderr.decode("utf-8").strip().splitlines()[-1])
                 output = target.read_bytes()
-                if validate_wav(output) != samples:
-                    return problem("The processed recording had an unexpected length.", 500)
+                if validate_wav(output) != (samples, sample_rate):
+                    return problem("The processed recording had an unexpected sample rate or length.", 500)
                 return web.Response(body=output, content_type="audio/wav", headers={
                     "Content-Disposition": 'inline; filename="sao-cleaned.wav"',
                     "X-Processing-Ms": f"{elapsed_ms:.3f}",
                     "X-Inference-Ms": f"{timing['processing_compute_seconds'] * 1000:.3f}",
                     "X-Real-Time-Factor": f"{timing['real_time_factor']:.6f}",
-                    "X-Audio-Duration": f"{samples / 48000:.6f}",
+                    "X-Audio-Duration": f"{samples / sample_rate:.6f}",
+                    "X-Hush-Enabled": str(enabled).lower(),
+                    "X-Attenuation-Limit-Db": str(attenuation),
                 })
             except TimeoutError:
                 return problem("Processing took too long. Try a shorter clip.", 504)

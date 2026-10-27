@@ -7,6 +7,28 @@ It integrates the authors' **pretrained DeepFilterNet3** model.
 Existing integration names remain compatible:
 the `sao-noise` package, `sao_noise` imports and `sao-denoise` executable.
 
+## Phone calls and video interviews
+
+Choose a preset, then override the values your transport needs:
+
+```python
+from sao_noise import HushConfig, RustDenoiser
+
+config = HushConfig.for_profile("phone_call", sample_rate=16000, atten_lim_db=24)
+denoiser = RustDenoiser("/absolute/path/to/sao-denoise", config=config)
+await denoiser.start()
+```
+
+`phone_call` starts at 8 kHz and `video_interview` at 48 kHz. Both start with
+24 dB reduction and enhancement enabled. These are convenience defaults, not
+quality-tuned presets. Supported rates are 8, 16 and 48 kHz; choose the rate
+of the decoded audio your transport actually supplies.
+
+Load [phone-call.json](examples/phone-call.json) or
+[video-interview.json](examples/video-interview.json) with
+`HushConfig.from_json(...)`. The [configuration guide](docs/configuration.md)
+shows how one config sets the filter, Pipecat transport and pipeline rate.
+
 ## Build
 
 Use Python 3.11 or 3.12 and a standard Rust toolchain with a system linker.
@@ -43,28 +65,42 @@ The lab finds `target/release/sao-denoise` (`.exe` on Windows). Override it with
 
 ## Audio contract
 
-- Mono, 48,000 Hz, signed 16-bit little-endian PCM.
-- Native calls process 480 samples / 10 ms. The Python client buffers partial
+- Mono, 8,000, 16,000 or 48,000 Hz, signed 16-bit little-endian PCM. Output keeps
+  the selected input rate. The model runs at 48 kHz; the 8/16 kHz paths add stateful,
+  band-limited conversion before and after enhancement.
+- Native calls process 80, 160 or 480 samples at 8, 16 or 48 kHz, always 10 ms.
+  The Python client buffers partial
   hops and exchanges up to four already available hops without waiting for more.
-- Signal alignment delay: 1,440 samples / 30 ms, plus up to 10 ms acquisition.
-  Inference, IPC, scheduling and transport add latency.
+- Signal alignment delay is 304 samples / 38 ms at 8 kHz, 544 samples / 34 ms
+  at 16 kHz and 1,440 samples / 30 ms at 48 kHz. The 8/16 kHz values include
+  both rate converters.
+  `algorithmic_delay_samples` is expressed in the selected rate's samples.
+  Frame acquisition adds up to 10 ms; inference, IPC,
+  scheduling and transport add latency.
 - Each stream owns a separate recurrent state and native process.
 - Default attenuation limit is 24 dB; finite values from 0 to 100 are accepted.
   Zero returns delayed dry audio, while the model continues to advance.
 - WAV mode pads, drains and compensates delay, preserving input sample count.
-  Live streams keep their delay. Feed at least 40 ms trailing silence before
-  stopping when the speech tail matters; the stop hook cannot return audio.
+  Live streams keep their delay. Feed trailing silence for at least the
+  reported delay plus one hop before stopping when the speech tail matters;
+  allow 50 ms at 8/16 kHz or 40 ms at 48 kHz. The stop hook cannot return audio.
 
 This is speech enhancement, not acoustic echo cancellation or target-speaker
 separation. It cannot guarantee removal of another person speaking nearby.
 Stereo and other sample rates require conversion before the streaming engine.
 Apply enhancement before VAD/STT. Evaluate cascaded filters before combining them.
 
+For phone calls, see the [telephony guide](docs/telephony.md), including
+G.711 decoding boundaries and Pipecat configuration.
+
 ## CLI and Python
 
 ```console
 target/release/sao-denoise wav input.wav cleaned.wav
 target/release/sao-denoise benchmark --seconds 10
+target/release/sao-denoise benchmark --profile phone_call --seconds 10
+
+target/release/sao-denoise stream --profile video_interview --atten-lim-db 18
 ```
 
 Add `.exe` on Windows. WAV output must not already exist. The CLI emits a JSON
@@ -83,7 +119,8 @@ finally:
 
 Use one instance per stream. For Pipecat, use
 `sao_noise.pipecat.DeepFilterNetFilter` as the input transport filter, configure
-mono audio at 48 kHz, and set `PipelineParams(audio_in_sample_rate=48000)`.
+mono audio at the selected rate, and use `config.sample_rate` for both the
+transport input and `PipelineParams(audio_in_sample_rate=...)`.
 The [Python guide](python/README.md) documents lifecycle and controls.
 
 ## Verify
@@ -106,7 +143,7 @@ cargo fmt -- --check
 cargo test --release --locked
 python -m unittest discover -s python/tests -v
 python -m unittest discover -s test-app -p test_server.py -v
-node --test test-app/test-recorder.cjs test-app/test-playback.cjs
+node --test test-app/test-recorder.cjs test-app/test-playback.cjs test-app/test-telephony.cjs
 ```
 
 Set `SAO_DENOISE_EXE` to the absolute newly built binary path before Python
@@ -133,6 +170,7 @@ overlapping speakers, downstream transcription and intended concurrent load.
 src/                  Rust engine and PCM/WAV command line
 python/src/sao_noise/  Async client and Pipecat input filter
 python/tests/         Protocol, lifecycle and native integration checks
+examples/             JSON settings for phone calls and video interviews
 test-app/             Browser lab and HTTP/capture/playback tests
 scripts/              Fixture generation and repeatable benchmarks
 vendor/               Pinned DeepFilterNet runtime, model and notices

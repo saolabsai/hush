@@ -7,6 +7,7 @@ is suitable for engineering checks only.
 ```sh
 python scripts/generate_fixture.py --output output/demo
 target/release/sao-denoise benchmark --seconds 10
+target/release/sao-denoise benchmark --sample-rate 8000 --seconds 10
 python scripts/benchmark_bridge.py --executable target/release/sao-denoise --frames 1000
 ```
 
@@ -27,8 +28,14 @@ recordings or generated output.
 Record the CPU, operating system, build profile, thread settings, packet size,
 attenuation limit, warmup and number of runs. Report startup separately from
 steady-state processing and use distributions rather than a single best run.
-The engine's 30 ms signal delay and up to 10 ms frame acquisition remain even
-when inference is fast.
+The 48 kHz engine's 30 ms signal delay and up to 10 ms frame acquisition remain
+even when inference is fast. At 8 kHz, include the reported rate-converter delay
+as well. Native 8 kHz benchmark timing includes the conversion and enhancement
+work; it does not establish performance under real phone-network jitter or loss.
+
+The fixture generator and Python benchmark scripts above remain 48 kHz tools.
+Use the native `benchmark --sample-rate 8000` command for 8 kHz compute timing,
+and the [telephony guide](telephony.md) for the phone-audio contract.
 
 Representative speech and noise, listening tests, downstream transcription
 accuracy and intended concurrent load are needed before making quality or

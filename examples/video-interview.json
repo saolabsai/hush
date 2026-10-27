@@ -1,0 +1,6 @@
+{
+  "profile": "video_interview",
+  "sample_rate": 48000,
+  "atten_lim_db": 24,
+  "enabled": true
+}

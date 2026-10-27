@@ -21,7 +21,7 @@
         <div class="signal-art" aria-hidden="true"><div class="signal-label">NOISE IN <span>VOICE OUT</span></div><div class="signal-lines"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="signal-footer">A little clarity changes everything.</div></div>
       </section>
 
-      <div class="engine-strip"><span class="engine-name"><span class="status-dot" id="engine-dot"></span><span id="engine-status">Connecting to the engine…</span></span><span class="engine-spec">DeepFilterNet3 <span>·</span> Rust inference <span>·</span> 48 kHz</span></div>
+      <div class="engine-strip"><span class="engine-name"><span class="status-dot" id="engine-dot"></span><span id="engine-status">Connecting to the engine…</span></span><span class="engine-spec">DeepFilterNet3 <span>·</span> Rust inference <span>·</span> 8 / 16 / 48 kHz</span></div>
       <div id="error-message" class="error-message" role="alert" hidden></div>
 
       <section class="workspace" aria-label="Noise suppression test">
@@ -30,14 +30,23 @@
           <p class="section-description">Choose a short clip with speech and background noise. The sample is an artificial waveform, not spoken words.</p>
           <button type="button" class="record-button" id="record-button" disabled><span class="mic-icon" id="record-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span><span><strong id="record-label">Record a clip</strong><span id="record-hint">Use your microphone · up to 60 seconds</span></span><span class="record-action" id="record-action" aria-hidden="true">↗</span></button>
           <div class="secondary-actions"><label class="button button-secondary upload-label" id="upload-label" aria-disabled="true"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 13V3m0 0L6 7m4-4 4 4M3 12v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Upload WAV<input type="file" id="file-input" accept=".wav,audio/wav,audio/x-wav" disabled></label><button class="button button-secondary" type="button" id="demo-button" disabled><span aria-hidden="true">▷</span>Try a sample</button></div>
-          <p class="input-note">Audio is sent to the app server when you clean it up. Temporary clips are removed after processing.</p>
+          <p class="input-note">Audio is sent to the app server when you process it. Temporary clips are removed after processing.</p>
           <div class="source-summary" id="source-summary"><span class="summary-mark" aria-hidden="true">♫</span><div><strong id="source-name">No clip selected</strong><span id="source-detail">Your listening test starts here.</span></div><span id="source-check" aria-hidden="true" hidden>✓</span></div>
 
           <div class="section-heading tuning-heading"><span class="step-number">02</span><h2>Find your balance</h2></div>
+          <div class="setting-grid">
+            <label>Use case<select id="profile" disabled><option value="phone_call">Phone call</option><option value="video_interview">Video interview</option></select></label>
+            <label>Audio sample rate<select id="sample-rate" disabled><option value="8000">8 kHz · phone</option><option value="16000">16 kHz · wideband</option><option value="48000">48 kHz · full-band</option></select></label>
+          </div>
+          <p class="input-note">Profiles provide starting values, not tuned quality settings. Change any value for your audio.</p>
+          <label class="enabled-setting"><input type="checkbox" id="enabled" checked disabled><span>Enable noise reduction</span></label>
           <div class="slider-heading"><label for="attenuation">Noise reduction limit</label><output id="attenuation-value" for="attenuation">24 dB</output></div>
-          <input type="range" min="0" max="60" value="24" step="1" id="attenuation" aria-describedby="attenuation-help" disabled>
+          <input type="range" min="0" max="100" value="24" step="any" id="attenuation" aria-describedby="attenuation-help" disabled>
           <div class="slider-scale" aria-hidden="true"><span>Light touch</span><span>More reduction</span></div>
+          <label class="exact-value" for="attenuation-number">Exact limit <span><input type="number" min="0" max="100" value="24" step="any" id="attenuation-number" disabled> dB</span></label>
           <p id="attenuation-help" class="input-note">Higher values allow stronger noise removal. Listen for the balance that keeps your voice natural.</p>
+          <div class="configuration-heading"><span>Integration settings</span><button type="button" id="copy-config" disabled>Copy JSON</button></div>
+          <pre id="config-preview" class="config-preview" aria-label="Hush configuration JSON">Connecting to the settings catalog…</pre>
           <button type="button" id="enhance-button" class="button button-primary" disabled><span id="enhance-label">Clean up audio</span><span id="enhance-arrow" aria-hidden="true">↗</span></button>
           <p id="activity" class="activity" role="status" aria-live="polite">Select a clip to get started.</p>
         </section>
