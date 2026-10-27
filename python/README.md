@@ -13,32 +13,49 @@ python -m pip install -e "./python[pipecat]"
 Omit `[pipecat]` for the standalone asynchronous client.
 
 ```python
+from pipecat.pipeline.worker import PipelineParams
+from pipecat.transports.base_transport import TransportParams
 from sao_noise.pipecat import DeepFilterNetFilter
 
 noise_filter = DeepFilterNetFilter(
     executable="/absolute/path/to/sao-denoise",  # .exe on Windows
     atten_lim_db=24.0,
 )
-# Configure your Pipecat transport:
-# audio_in_enabled=True, audio_in_sample_rate=48000, audio_in_channels=1,
-# audio_in_filter=noise_filter
-# Also set PipelineParams(audio_in_sample_rate=48000).
+transport_params = TransportParams(
+    audio_in_enabled=True,
+    audio_in_sample_rate=8000,
+    audio_in_channels=1,
+    audio_in_filter=noise_filter,
+)
+pipeline_params = PipelineParams(audio_in_sample_rate=8000)
 ```
 
-For direct use, call `await start(48000)`, `await process(pcm_bytes)`, and
+Use these input settings with your transport's parameters and pass
+`pipeline_params` to its pipeline worker. The transport must deliver decoded
+mono PCM16 LE to the filter. See the [telephony guide](../docs/telephony.md) for
+codec boundaries. Use `48000` in both settings for a full-band stream.
+
+For direct use, call `await start(8000)` or `await start(48000)`,
+`await process(pcm_bytes)`, and
 `await stop()` in `finally` on `sao_noise.RustDenoiser`. Use a separate instance
-per input stream. Input must be mono PCM16 little-endian at 48 kHz; raw bytes
-cannot reveal stereo, so channel count must be configured upstream.
+per input stream. Input must be mono PCM16 little-endian at the selected rate;
+raw bytes cannot reveal stereo, so channel count must be configured upstream.
+An 8 kHz stream is converted to the pretrained model's 48 kHz rate and back
+inside the native worker, preserving state across calls.
 
 ## Framing and controls
 
-Input may contain any number of complete two-byte samples. Partial 480-sample
-hops are buffered; an output call can return fewer bytes than its input, or none.
-Up to four available hops are exchanged per bounded IPC call (3,840 bytes),
+Input may contain any number of complete two-byte samples. Partial 80-sample
+hops at 8 kHz or 480-sample hops at 48 kHz are buffered; an output call can
+return fewer bytes than its input, or none.
+Up to four available hops are exchanged per bounded IPC call,
 without waiting to fill a batch. No audio is silently dropped to match lengths.
 
-Startup metadata reports 1,440 samples / 30 ms signal delay. Frame acquisition
-adds up to 10 ms; IPC, processing, scheduling and transport add their own delay.
+Startup metadata reports the selected sample rate, frame length and total
+signal delay in that rate's samples. At 48 kHz the delay is 1,440 samples /
+30 ms; at 8 kHz it is 304 samples / 38 ms, including rate-converter delay.
+Frame acquisition adds up to 10 ms; IPC, processing, scheduling and transport
+add their own delay.
 Initial delayed samples remain in live output.
 
 Send `FilterUpdateSettingsFrame(settings={"enabled": False})` upstream to the
@@ -52,8 +69,9 @@ Control modes follow input samples through the delay; toggles preserve order
 and buffered state. Instant wet/dry switching has no crossfade and may click.
 
 `stop()` discards incomplete input and delayed tail because Pipecat cleanup
-cannot emit audio. Preserve at least 40 ms trailing silence when the last speech
-samples matter. Restart creates fresh state and re-enables enhancement.
+cannot emit audio. Preserve trailing silence for at least the reported signal
+delay plus one hop when the last speech samples matter: allow 50 ms at 8 kHz
+or 40 ms at 48 kHz. Restart creates fresh state and re-enables enhancement.
 
 ## Failures and lifecycle
 

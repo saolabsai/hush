@@ -7,7 +7,7 @@ from .stream import RustDenoiser
 
 
 class DeepFilterNetFilter(BaseAudioFilter):
-    """A mono, 48 kHz Pipecat filter backed by the persistent Rust worker.
+    """A mono, 8/48 kHz Pipecat filter backed by the persistent Rust worker.
 
     Constructor arguments are forwarded to :class:`RustDenoiser`. Create a
     separate instance per meeting microphone/participant audio stream.

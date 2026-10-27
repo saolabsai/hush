@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use sao_noise::{Denoiser, SAMPLE_RATE};
+use sao_noise::{StreamDenoiser, SAMPLE_RATE, TELEPHONY_SAMPLE_RATE};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -25,8 +25,10 @@ enum Command {
     Stream {
         #[arg(long, default_value = "24", value_parser = parse_attenuation)]
         atten_lim_db: f32,
+        #[arg(long, default_value = "48000", value_parser = parse_sample_rate)]
+        sample_rate: u32,
     },
-    /// Denoise a mono PCM16 48 kHz WAV, preserving length and compensating delay.
+    /// Denoise a mono PCM16 8 or 48 kHz WAV, preserving rate, length and alignment.
     /// Existing output files are never overwritten.
     Wav {
         input: PathBuf,
@@ -41,7 +43,19 @@ enum Command {
         seconds: f64,
         #[arg(long, default_value = "24", value_parser = parse_attenuation)]
         atten_lim_db: f32,
+        #[arg(long, default_value = "48000", value_parser = parse_sample_rate)]
+        sample_rate: u32,
     },
+}
+
+fn parse_sample_rate(value: &str) -> std::result::Result<u32, String> {
+    let rate = value
+        .parse()
+        .map_err(|_| "expected a sample rate".to_owned())?;
+    if !matches!(rate, TELEPHONY_SAMPLE_RATE | SAMPLE_RATE) {
+        return Err("supported sample rates are 8000 and 48000 Hz".into());
+    }
+    Ok(rate)
 }
 
 fn parse_attenuation(value: &str) -> std::result::Result<f32, String> {
@@ -62,8 +76,11 @@ fn parse_seconds(value: &str) -> std::result::Result<f64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Stream { atten_lim_db } => {
-            let mut denoiser = Denoiser::new(atten_lim_db)?;
+        Command::Stream {
+            atten_lim_db,
+            sample_rate,
+        } => {
+            let mut denoiser = StreamDenoiser::new(sample_rate, atten_lim_db)?;
             let stdin = io::stdin();
             let stdout = io::stdout();
             stream(&mut stdin.lock(), &mut stdout.lock(), &mut denoiser)
@@ -76,27 +93,28 @@ fn main() -> Result<()> {
         Command::Benchmark {
             seconds,
             atten_lim_db,
-        } => benchmark(seconds, atten_lim_db),
+            sample_rate,
+        } => benchmark(seconds, atten_lim_db, sample_rate),
     }
 }
 
 fn stream<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    denoiser: &mut Denoiser,
+    denoiser: &mut StreamDenoiser,
 ) -> Result<()> {
     let frame_samples = denoiser.frame_samples();
-    writeln!(
-        writer,
-        "{}",
-        json!({
-            "protocol": 1,
-            "sample_rate": SAMPLE_RATE,
-            "frame_samples": frame_samples,
-            "algorithmic_delay_samples": denoiser.delay_samples(),
-            "model": "DeepFilterNet3",
-        })
-    )?;
+    let mut header = json!({
+        "protocol": 1,
+        "sample_rate": denoiser.sample_rate(),
+        "frame_samples": frame_samples,
+        "algorithmic_delay_samples": denoiser.delay_samples(),
+        "model": "DeepFilterNet3",
+    });
+    if denoiser.sample_rate() != SAMPLE_RATE {
+        header["model_sample_rate"] = json!(SAMPLE_RATE);
+    }
+    writeln!(writer, "{header}")?;
     writer.flush()?;
 
     let mut bytes = vec![0_u8; frame_samples * 2];
@@ -165,12 +183,12 @@ fn encode_pcm16(samples: &[f32], output: &mut [u8]) -> Result<()> {
 
 fn validate_wav_spec(spec: hound::WavSpec) -> Result<()> {
     if spec.channels != 1
-        || spec.sample_rate != SAMPLE_RATE
+        || !matches!(spec.sample_rate, TELEPHONY_SAMPLE_RATE | SAMPLE_RATE)
         || spec.sample_format != hound::SampleFormat::Int
         || spec.bits_per_sample != 16
     {
         bail!(
-            "expected mono PCM16 WAV at {SAMPLE_RATE} Hz; got {} channel(s), {} Hz, {:?}, {} bits",
+            "expected mono PCM16 WAV at 8000 or 48000 Hz; got {} channel(s), {} Hz, {:?}, {} bits",
             spec.channels,
             spec.sample_rate,
             spec.sample_format,
@@ -197,7 +215,7 @@ fn wav(input_path: &Path, output_path: &Path, atten_lim_db: f32) -> Result<()> {
         .samples::<i16>()
         .collect::<std::result::Result<_, _>>()
         .context("reading PCM16 WAV samples")?;
-    let mut denoiser = Denoiser::new(atten_lim_db)?;
+    let mut denoiser = StreamDenoiser::new(spec.sample_rate, atten_lim_db)?;
     let frame_samples = denoiser.frame_samples();
     let delay_samples = denoiser.delay_samples();
     let output_end = samples
@@ -257,7 +275,13 @@ fn wav(input_path: &Path, output_path: &Path, atten_lim_db: f32) -> Result<()> {
         writer.write_sample(sample)?;
     }
     writer.finalize().context("finalizing output WAV")?;
-    let mut report = timing_report(&frame_seconds, samples.len(), frame_samples, delay_samples);
+    let mut report = timing_report(
+        &frame_seconds,
+        samples.len(),
+        frame_samples,
+        delay_samples,
+        spec.sample_rate,
+    );
     report["operation"] = json!("wav");
     report["atten_lim_db"] = json!(atten_lim_db);
     report["input_samples"] = json!(samples.len());
@@ -267,17 +291,17 @@ fn wav(input_path: &Path, output_path: &Path, atten_lim_db: f32) -> Result<()> {
     Ok(())
 }
 
-fn benchmark(seconds: f64, atten_lim_db: f32) -> Result<()> {
-    let mut denoiser = Denoiser::new(atten_lim_db)?;
+fn benchmark(seconds: f64, atten_lim_db: f32, sample_rate: u32) -> Result<()> {
+    let mut denoiser = StreamDenoiser::new(sample_rate, atten_lim_db)?;
     let frame_samples = denoiser.frame_samples();
-    let frames = (seconds * SAMPLE_RATE as f64 / frame_samples as f64).ceil() as usize;
+    let frames = (seconds * sample_rate as f64 / frame_samples as f64).ceil() as usize;
     let mut input = vec![0.0; frame_samples];
     let mut output = vec![0.0; frame_samples];
     let mut frame_seconds = Vec::with_capacity(frames);
     let mut noise_state = 0x1234_5678_u32;
     for frame in 0..frames {
         for (offset, sample) in input.iter_mut().enumerate() {
-            let time = (frame * frame_samples + offset) as f64 / SAMPLE_RATE as f64;
+            let time = (frame * frame_samples + offset) as f64 / sample_rate as f64;
             noise_state = noise_state
                 .wrapping_mul(1_664_525)
                 .wrapping_add(1_013_904_223);
@@ -302,6 +326,7 @@ fn benchmark(seconds: f64, atten_lim_db: f32) -> Result<()> {
         frames * frame_samples,
         frame_samples,
         denoiser.delay_samples(),
+        sample_rate,
     );
     report["operation"] = json!("benchmark");
     report["fixture"] = json!("deterministic_synthetic_multitone_and_noise");
@@ -318,9 +343,10 @@ fn timing_report(
     audio_samples: usize,
     frame_samples: usize,
     delay_samples: usize,
+    sample_rate: u32,
 ) -> Value {
     let processing_seconds: f64 = frame_seconds.iter().sum();
-    let audio_seconds = audio_samples as f64 / SAMPLE_RATE as f64;
+    let audio_seconds = audio_samples as f64 / sample_rate as f64;
     let mut sorted = frame_seconds.to_vec();
     sorted.sort_by(f64::total_cmp);
     let percentile_ms = |percentile: f64| -> Option<f64> {
@@ -330,9 +356,9 @@ fn timing_report(
             Some(sorted[((sorted.len() - 1) as f64 * percentile).round() as usize] * 1000.0)
         }
     };
-    json!({
+    let mut report = json!({
         "model": "DeepFilterNet3",
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": sample_rate,
         "frame_samples": frame_samples,
         "algorithmic_delay_samples": delay_samples,
         "frames_processed": frame_seconds.len(),
@@ -342,7 +368,12 @@ fn timing_report(
         "frame_p50_ms": percentile_ms(0.50),
         "frame_p95_ms": percentile_ms(0.95),
         "timing_scope": "process_frame_only; excludes model loading, I/O, PCM conversion and fixture generation",
-    })
+    });
+    if sample_rate != SAMPLE_RATE {
+        report["model_sample_rate"] = json!(SAMPLE_RATE);
+        report["timing_scope"] = json!("process_frame_including_resampling; excludes model loading, I/O, PCM conversion and fixture generation");
+    }
+    report
 }
 
 #[cfg(test)]
@@ -424,6 +455,11 @@ mod tests {
         };
         assert!(validate_wav_spec(spec).is_ok());
         assert!(validate_wav_spec(hound::WavSpec {
+            sample_rate: TELEPHONY_SAMPLE_RATE,
+            ..spec
+        })
+        .is_ok());
+        assert!(validate_wav_spec(hound::WavSpec {
             channels: 2,
             ..spec
         })
@@ -443,5 +479,14 @@ mod tests {
             ..spec
         })
         .is_err());
+    }
+
+    #[test]
+    fn stream_rate_parser_accepts_telephone_and_full_band_only() {
+        assert_eq!(parse_sample_rate("8000").unwrap(), 8000);
+        assert_eq!(parse_sample_rate("48000").unwrap(), 48000);
+        for invalid in ["8", "16000", "0", "NaN", "-8000", "8khz"] {
+            assert!(parse_sample_rate(invalid).is_err());
+        }
     }
 }

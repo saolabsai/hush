@@ -36,8 +36,14 @@ Use headphones during playback. The browser requests its echo cancellation,
 automatic gain and noise suppression off for a useful comparison, but device
 drivers and the operating system may still process microphone audio.
 
-The browser converts recordings to mono PCM16 at 48 kHz. WAV output compensates
-the engine delay and preserves input duration. Displayed whole-clip processing
+Microphone recordings are prepared as mono PCM16 at 48 kHz. Uploaded mono
+PCM16 WAVs at 8 kHz or 48 kHz keep their original rate and PCM bytes when sent
+to the engine, including phone clips. Other browser-decodable WAV formats are
+converted to mono 48 kHz. G.711 mu-law/A-law call audio must first be decoded
+to linear PCM16 WAV; see the [telephony guide](../docs/telephony.md).
+
+WAV output compensates the engine delay and preserves input rate and duration.
+Displayed whole-clip processing
 includes startup; native inference timing excludes capture/network. There is
 one enhancement request at a time. No acoustic echo cancellation or isolation
 of an individual person from overlapping voices is provided.
@@ -48,6 +54,7 @@ Audio uploads only when you select **Clean up audio**. With the default loopback
 server, processing happens on your computer. Temporary request files are removed
 after processing; no recording history is kept. Browser clips remain in memory
 until replaced or the page closes.
+Supported PCM WAV uploads send the original file, including any WAV metadata.
 
 For remote microphone access, place an HTTPS reverse proxy in front of loopback
 and pass its exact origin:
@@ -65,7 +72,7 @@ remotely, audio is sent to that server and passes through your proxy provider.
 
 ```console
 python -m unittest discover -s test-app -p test_server.py -v
-node --test test-app/test-recorder.cjs test-app/test-playback.cjs
+node --test test-app/test-recorder.cjs test-app/test-playback.cjs test-app/test-telephony.cjs
 ```
 
 Set `SAO_DENOISE_EXE` to the built absolute binary path. Native checks require

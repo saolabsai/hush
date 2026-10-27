@@ -76,19 +76,56 @@ function clearResult() {
   drawWaveforms();
 }
 
-function createWav(samples) {
+function createWav(samples, sampleRate = 48000) {
   const bytes = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(bytes);
   function write(offset, text) { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); }
   write(0, 'RIFF'); view.setUint32(4, bytes.byteLength - 8, true); write(8, 'WAVE');
   write(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true); view.setUint32(24, 48000, true); view.setUint32(28, 96000, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
   view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, 'data'); view.setUint32(40, samples.length * 2, true);
   for (let i = 0; i < samples.length; i++) {
     const sample = Math.max(-1, Math.min(1, samples[i]));
     view.setInt16(44 + i * 2, Math.round(sample < 0 ? sample * 32768 : sample * 32767), true);
   }
   return new Blob([bytes], { type: 'audio/wav' });
+}
+
+function parseNativeWav(bytes) {
+  const view = new DataView(bytes);
+  const text = (offset, size) => String.fromCharCode(...new Uint8Array(bytes, offset, size));
+  if (view.byteLength < 12 || text(0, 4) !== 'RIFF' || text(8, 4) !== 'WAVE') return null;
+  const end = view.getUint32(4, true) + 8;
+  if (end < 12 || end > view.byteLength) throw new Error('The WAV file is incomplete. Please choose a complete recording.');
+  let format = null, data = null;
+  for (let offset = 12; offset < end;) {
+    if (offset + 8 > end) throw new Error('The WAV contains an incomplete chunk header.');
+    const kind = text(offset, 4), size = view.getUint32(offset + 4, true);
+    const start = offset + 8, next = start + size + (size % 2);
+    if (next > end) throw new Error('The WAV contains an incomplete chunk or missing padding.');
+    if (kind === 'fmt ') {
+      if (format || size < 16) throw new Error('The WAV format chunk is invalid.');
+      format = {
+        codec: view.getUint16(start, true), channels: view.getUint16(start + 2, true),
+        sampleRate: view.getUint32(start + 4, true), byteRate: view.getUint32(start + 8, true),
+        blockAlign: view.getUint16(start + 12, true), bits: view.getUint16(start + 14, true),
+      };
+    } else if (kind === 'data') {
+      if (!format) throw new Error('The WAV audio data appears before its format chunk.');
+      if (data) throw new Error('The WAV contains multiple audio data chunks.');
+      data = { start, size };
+    }
+    offset = next;
+  }
+  if (!format || !data) throw new Error('The WAV is missing its format or audio data chunk.');
+  if (format.codec !== 1 || format.channels !== 1 || format.bits !== 16 || ![8000, 48000].includes(format.sampleRate)) return null;
+  if (format.blockAlign !== 2 || format.byteRate !== format.sampleRate * 2 || data.size % 2) throw new Error('The WAV contains invalid PCM16 framing.');
+  if (!data.size) throw new Error('The audio file is empty. Please choose a clip with some sound.');
+  const count = data.size / 2;
+  if (count > state.maxDuration * format.sampleRate) throw new Error(`Please choose a clip of ${state.maxDuration} seconds or less.`);
+  const samples = new Float32Array(count);
+  for (let index = 0; index < count; index++) samples[index] = view.getInt16(data.start + index * 2, true) / 32768;
+  return { samples, sampleRate: format.sampleRate, blob: new Blob([bytes], { type: 'audio/wav' }) };
 }
 
 async function decodeAudio(bytes) {
@@ -164,12 +201,12 @@ function animateWaveforms() {
   draw();
 }
 
-function setSource(samples, name, description) {
+function setSource(samples, name, description, sampleRate = 48000, rawBlob = null) {
   clearResult();
   resetPlayer(ui['original-player']);
   state.playing = null;
   if (state.sourceUrl) URL.revokeObjectURL(state.sourceUrl);
-  state.source = { blob: createWav(samples), duration: samples.length / 48000, name };
+  state.source = { blob: rawBlob || createWav(samples, sampleRate), duration: samples.length / sampleRate, sampleRate, name };
   state.sourceUrl = URL.createObjectURL(state.source.blob);
   state.originalPeaks = makePeaks(samples);
   ui['original-player'].src = state.sourceUrl;
@@ -178,7 +215,7 @@ function setSource(samples, name, description) {
   ui['original-duration'].textContent = timeLabel(state.source.duration);
   ui['source-name'].textContent = name;
   ui['source-name'].title = name;
-  ui['source-detail'].textContent = `${state.source.duration.toFixed(1)} sec · ${description} · mono 48 kHz`;
+  ui['source-detail'].textContent = `${state.source.duration.toFixed(1)} sec · ${description} · mono ${sampleRate / 1000} kHz`;
   ui['source-check'].hidden = false;
   message('Ready when you are. Clean up the clip, then compare A and B.');
   drawWaveforms(); updateControls();
@@ -205,9 +242,10 @@ async function loadAudio(source) {
       if (source.size > 64 * 1024 * 1024) throw new Error('This file is too large. Choose a WAV file smaller than 64 MB and up to 60 seconds long.');
       bytes = await source.arrayBuffer(); name = source.name; description = 'uploaded clip';
     }
-    const samples = await prepareMono(await decodeAudio(bytes));
+    const native = parseNativeWav(bytes);
+    const samples = native ? native.samples : await prepareMono(await decodeAudio(bytes));
     if (state.token !== token || state.unloaded) return;
-    setSource(samples, name, description);
+    setSource(samples, name, description, native ? native.sampleRate : 48000, native?.blob);
   } catch (error) { if (state.token === token) { showError(error); message(state.source ? 'Your previous clip is still available.' : 'Choose another clip to get started.'); } }
   finally { if (state.token === token && !state.unloaded) setMode('idle'); ui['file-input'].value = ''; }
 }

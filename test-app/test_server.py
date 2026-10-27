@@ -27,7 +27,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from server import create_app  # noqa: E402
+from server import create_app, validate_wav  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -110,6 +110,7 @@ class ApiTests(_ApiClient):
         status = await response.json()
         self.assertEqual(status["model"], "DeepFilterNet3")
         self.assertEqual(status["sample_rate"], RATE)
+        self.assertEqual(status["supported_sample_rates"], [8000, 48000])
         self.assertEqual(status["max_duration_seconds"], 60)
         self.assertEqual(status["default_attenuation_db"], 24)
         self.assertEqual(status["ready"], EXECUTABLE.is_file())
@@ -134,6 +135,26 @@ class ApiTests(_ApiClient):
         await self.assert_error(await client.get("/api/demo"), 404)
         response = await client.post("/api/enhance", data=make_wav([0] * 480))
         await self.assert_error(response, 503)
+
+    async def test_engine_output_must_keep_the_input_sample_rate(self):
+        client = TestClient(TestServer(create_app(executable=Path(__file__))))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+
+        class FinishedWorker:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b'{"processing_compute_seconds":0.001,"real_time_factor":0.1}'
+
+        async def wrong_rate_worker(*arguments, **kwargs):
+            Path(arguments[3]).write_bytes(make_wav([0] * 80, rate=48000))
+            return FinishedWorker()
+
+        with patch("server.asyncio.create_subprocess_exec", side_effect=wrong_rate_worker):
+            response = await client.post("/api/enhance", data=make_wav([0] * 80, rate=8000))
+        await self.assert_error(response, 500)
+        self.assertIn("sample rate", (await response.json())["error"])
 
     async def test_foreign_origins_cannot_submit_microphone_audio(self):
         for origin in ("https://example.com", "null", "http://127.0.0.1:1"):
@@ -240,8 +261,43 @@ class PublicConfigurationTests(unittest.TestCase):
                 create_app(public_origin=origin)
 
 
+class WavValidationTests(unittest.TestCase):
+    def test_supported_rates_use_their_own_duration_limit(self):
+        for rate in (8000, 48000):
+            with self.subTest(rate=rate):
+                payload = make_wav(bytes(60 * rate * 2), rate=rate)
+                self.assertEqual(validate_wav(payload), (60 * rate, rate))
+                with self.assertRaises(OverflowError):
+                    validate_wav(make_wav(bytes((60 * rate + 1) * 2), rate=rate))
+
+    def test_telephone_wav_rejects_empty_and_incomplete_samples(self):
+        for payload in (make_wav([], rate=8000), make_wav([1, -1], rate=8000)[:-1]):
+            with self.subTest(size=len(payload)), self.assertRaises(ValueError):
+                validate_wav(payload)
+
+
 @unittest.skipUnless(EXECUTABLE.is_file(), "build release sao-denoise for native HTTP checks")
 class NativeApiTests(_ApiClient):
+    async def test_phone_upload_keeps_8_khz_rate_duration_and_partial_tail(self):
+        noise = random.Random(8000)
+        samples = [noise.randrange(-5000, 5001) for _ in range(4173)]
+        response = await self.client.post("/api/enhance", data=make_wav(samples, rate=8000))
+        self.assertEqual(response.status, 200, await response.text() if response.status != 200 else "")
+        metadata, cleaned, count = read_wav(await response.read())
+        self.assertEqual(metadata, (1, 2, 8000))
+        self.assertEqual(count, len(samples))
+        self.assertTrue(any(cleaned[-13:]), "8 kHz partial final hop was lost")
+        self.assertAlmostEqual(float(response.headers["X-Audio-Duration"]), len(samples) / 8000, places=6)
+
+    async def test_phone_zero_attenuation_keeps_exact_pcm_and_alignment(self):
+        samples = [int(12000 * math.sin(index * 0.23)) for index in range(1653)]
+        response = await self.client.post("/api/enhance?attenuation=0", data=make_wav(samples, rate=8000))
+        self.assertEqual(response.status, 200, await response.text() if response.status != 200 else "")
+        metadata, cleaned, count = read_wav(await response.read())
+        self.assertEqual(metadata, (1, 2, 8000))
+        self.assertEqual(count, len(samples))
+        self.assertEqual(list(cleaned), samples)
+
     async def test_enhancement_preserves_partial_frame_and_tail_after_pause(self):
         samples = synthetic_samples()
         self.assertNotEqual(len(samples) % 480, 0)
@@ -309,8 +365,10 @@ class NativeApiTests(_ApiClient):
                 await self.assert_error(response, 400)
 
     async def test_recordings_longer_than_one_minute_are_rejected(self):
-        response = await self.client.post("/api/enhance", data=io.BytesIO(make_wav(bytes(61 * RATE * 2))))
-        await self.assert_error(response, 413)
+        for rate in (8000, 48000):
+            with self.subTest(rate=rate):
+                response = await self.client.post("/api/enhance", data=io.BytesIO(make_wav(bytes(61 * rate * 2), rate=rate)))
+                await self.assert_error(response, 413)
 
     async def test_oversized_request_body_is_rejected(self):
         response = await self.client.post("/api/enhance", data=io.BytesIO(bytes(8 * 1024 * 1024)))

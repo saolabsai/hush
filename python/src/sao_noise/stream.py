@@ -20,12 +20,13 @@ class StreamInfo:
     frame_samples: int
     algorithmic_delay_samples: int
     model: str
+    model_sample_rate: int = 48_000
 
 
 class RustDenoiser:
-    """One native process and one audio timeline, for mono PCM16 LE at 48 kHz.
+    """One native process and one audio timeline, for mono PCM16 LE at 8/48 kHz.
 
-    ``process`` buffers incomplete 480-sample hops. It exchanges up to four
+    ``process`` buffers incomplete 10 ms hops. It exchanges up to four
     already available hops together, without waiting for additional input.
     Each exchange stays below 4 KiB so stdin and stdout cannot fill one another
     while processing large inputs, including with small Windows pipe buffers.
@@ -38,6 +39,8 @@ class RustDenoiser:
     """
 
     SAMPLE_RATE = 48_000
+    SUPPORTED_SAMPLE_RATES = (8_000, 48_000)
+    # Compatibility defaults; active framing is reported in stream_info.
     FRAME_SAMPLES = 480
     FRAME_BYTES = FRAME_SAMPLES * 2
     MAX_EXCHANGE_BYTES = FRAME_BYTES * 4
@@ -80,6 +83,7 @@ class RustDenoiser:
         self._dry_delay = bytearray()
         self._mode_delay = bytearray()
         self._enabled = True
+        self._input_started = False
 
     @property
     def stream_info(self) -> StreamInfo | None:
@@ -100,19 +104,23 @@ class RustDenoiser:
         return self._stderr_tail.decode("utf-8", errors="replace").strip()
 
     async def start(self, sample_rate: int = SAMPLE_RATE) -> None:
-        if sample_rate != self.SAMPLE_RATE:
-            raise ValueError("sao-noise requires mono PCM16 LE at 48000 Hz; resample before the filter")
+        if type(sample_rate) is not int or sample_rate not in self.SUPPORTED_SAMPLE_RATES:
+            raise ValueError("sao-noise requires mono PCM16 LE at 8000 or 48000 Hz")
         async with self._lock:
             if self._process is not None:
                 raise RuntimeError("denoiser is already started; call stop() before restarting")
             self._stderr_tail.clear()
             self._enabled = True
+            self._input_started = False
             try:
                 async with asyncio.timeout(self._startup_timeout):
+                    arguments = [*self._command, "stream", "--atten-lim-db", str(self._atten_lim_db)]
+                    if sample_rate != self.SAMPLE_RATE:
+                        arguments.extend(("--sample-rate", str(sample_rate)))
                     # Shield process creation so cancellation cannot lose the
                     # handle to a process that the OS has already launched.
                     spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-                        *self._command, "stream", "--atten-lim-db", str(self._atten_lim_db),
+                        *arguments,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -127,7 +135,7 @@ class RustDenoiser:
                     self._stderr_task = asyncio.create_task(self._drain_stderr(self._process.stderr))
                     assert self._process.stdout is not None
                     header = await self._process.stdout.readline()
-                    self._info = self._parse_header(header)
+                    self._info = self._parse_header(header, sample_rate)
                     delay_bytes = self._info.algorithmic_delay_samples * 2
                     self._dry_delay = bytearray(delay_bytes)
                     self._mode_delay = bytearray([1]) * delay_bytes
@@ -139,21 +147,27 @@ class RustDenoiser:
                 raise self._error("native denoiser startup failed", exc) from exc
 
     @classmethod
-    def _parse_header(cls, header: bytes) -> StreamInfo:
+    def _parse_header(cls, header: bytes, sample_rate: int = SAMPLE_RATE) -> StreamInfo:
+        if type(sample_rate) is not int or sample_rate not in cls.SUPPORTED_SAMPLE_RATES:
+            raise ValueError("unsupported requested sample rate")
         if not header.endswith(b"\n") or len(header) > 4096:
             raise ValueError("missing or oversized startup JSON line")
         data = json.loads(header)
         if not isinstance(data, dict):
             raise ValueError("startup JSON must be an object")
-        for key, expected in (("protocol", 1), ("sample_rate", cls.SAMPLE_RATE), ("frame_samples", cls.FRAME_SAMPLES)):
+        frame_samples = sample_rate // 100
+        for key, expected in (("protocol", 1), ("sample_rate", sample_rate), ("frame_samples", frame_samples)):
             if type(data.get(key)) is not int or data[key] != expected:
                 raise ValueError(f"unsupported native {key}: {data.get(key)!r}")
         delay = data.get("algorithmic_delay_samples")
-        if type(delay) is not int or not 0 <= delay <= cls.SAMPLE_RATE:
-            raise ValueError("invalid native algorithmic_delay_samples (expected 0..48000)")
+        if type(delay) is not int or not 0 <= delay <= sample_rate:
+            raise ValueError(f"invalid native algorithmic_delay_samples (expected 0..{sample_rate})")
         if data.get("model") != "DeepFilterNet3":
             raise ValueError(f"unsupported native model: {data.get('model')!r}")
-        return StreamInfo(cls.SAMPLE_RATE, cls.FRAME_SAMPLES, delay, data["model"])
+        model_rate = data.get("model_sample_rate", cls.SAMPLE_RATE)
+        if type(model_rate) is not int or model_rate != cls.SAMPLE_RATE:
+            raise ValueError("unsupported native model_sample_rate")
+        return StreamInfo(sample_rate, frame_samples, delay, data["model"], model_rate)
 
     async def set_enabled(self, enabled: bool) -> None:
         """Apply a mode to future input; already buffered samples keep their mode."""
@@ -161,6 +175,8 @@ class RustDenoiser:
             raise TypeError("enabled must be a bool")
         async with self._lock:
             self._require_started()
+            if not self._input_started:
+                self._mode_delay[:] = bytes([int(enabled)]) * len(self._mode_delay)
             self._enabled = enabled
 
     async def process(self, audio: bytes) -> bytes:
@@ -175,13 +191,18 @@ class RustDenoiser:
             raise ValueError("PCM16 input must contain complete two-byte samples")
         async with self._lock:
             self._require_started()
+            assert self._info is not None
+            frame_bytes = self._info.frame_samples * 2
+            exchange_bytes = frame_bytes * 4
+            if audio:
+                self._input_started = True
             self._pending.extend(audio)
             self._pending_modes.extend(bytes([int(self._enabled)]) * len(audio))
-            complete_bytes = len(self._pending) // self.FRAME_BYTES * self.FRAME_BYTES
+            complete_bytes = len(self._pending) // frame_bytes * frame_bytes
             output = bytearray()
             try:
-                for offset in range(0, complete_bytes, self.MAX_EXCHANGE_BYTES):
-                    end = min(offset + self.MAX_EXCHANGE_BYTES, complete_bytes)
+                for offset in range(0, complete_bytes, exchange_bytes):
+                    end = min(offset + exchange_bytes, complete_bytes)
                     batch = bytes(self._pending[offset:end])
                     batch_bytes = len(batch)
                     modes = self._pending_modes[offset:end]
@@ -261,6 +282,7 @@ class RustDenoiser:
         process, self._process = self._process, None
         stderr_task, self._stderr_task = self._stderr_task, None
         self._info = None
+        self._input_started = False
         self._pending.clear()
         self._pending_modes.clear()
         self._dry_delay.clear()

@@ -43,28 +43,39 @@ The lab finds `target/release/sao-denoise` (`.exe` on Windows). Override it with
 
 ## Audio contract
 
-- Mono, 48,000 Hz, signed 16-bit little-endian PCM.
-- Native calls process 480 samples / 10 ms. The Python client buffers partial
+- Mono, 8,000 or 48,000 Hz, signed 16-bit little-endian PCM. Output keeps the
+  selected input rate. The model runs at 48 kHz; the 8 kHz path adds stateful,
+  band-limited conversion before and after enhancement.
+- Native calls process 80 samples at 8 kHz or 480 at 48 kHz, both 10 ms.
+  The Python client buffers partial
   hops and exchanges up to four already available hops without waiting for more.
-- Signal alignment delay: 1,440 samples / 30 ms, plus up to 10 ms acquisition.
-  Inference, IPC, scheduling and transport add latency.
+- Signal alignment delay is 1,440 samples / 30 ms at 48 kHz and 304 samples /
+  38 ms at 8 kHz. The 8 kHz value includes both rate converters.
+  `algorithmic_delay_samples` is expressed in the selected rate's samples.
+  Frame acquisition adds up to 10 ms; inference, IPC,
+  scheduling and transport add latency.
 - Each stream owns a separate recurrent state and native process.
 - Default attenuation limit is 24 dB; finite values from 0 to 100 are accepted.
   Zero returns delayed dry audio, while the model continues to advance.
 - WAV mode pads, drains and compensates delay, preserving input sample count.
-  Live streams keep their delay. Feed at least 40 ms trailing silence before
-  stopping when the speech tail matters; the stop hook cannot return audio.
+  Live streams keep their delay. Feed trailing silence for at least the
+  reported delay plus one hop before stopping when the speech tail matters;
+  allow 50 ms at 8 kHz or 40 ms at 48 kHz. The stop hook cannot return audio.
 
 This is speech enhancement, not acoustic echo cancellation or target-speaker
 separation. It cannot guarantee removal of another person speaking nearby.
 Stereo and other sample rates require conversion before the streaming engine.
 Apply enhancement before VAD/STT. Evaluate cascaded filters before combining them.
 
+For phone calls, see the [8 kHz telephony guide](docs/telephony.md), including
+G.711 decoding boundaries and Pipecat configuration.
+
 ## CLI and Python
 
 ```console
 target/release/sao-denoise wav input.wav cleaned.wav
 target/release/sao-denoise benchmark --seconds 10
+target/release/sao-denoise benchmark --sample-rate 8000 --seconds 10
 ```
 
 Add `.exe` on Windows. WAV output must not already exist. The CLI emits a JSON
@@ -83,7 +94,8 @@ finally:
 
 Use one instance per stream. For Pipecat, use
 `sao_noise.pipecat.DeepFilterNetFilter` as the input transport filter, configure
-mono audio at 48 kHz, and set `PipelineParams(audio_in_sample_rate=48000)`.
+mono audio at the selected 8 kHz or 48 kHz rate, and set
+`PipelineParams(audio_in_sample_rate=8000)` for an 8 kHz phone stream.
 The [Python guide](python/README.md) documents lifecycle and controls.
 
 ## Verify
@@ -106,7 +118,7 @@ cargo fmt -- --check
 cargo test --release --locked
 python -m unittest discover -s python/tests -v
 python -m unittest discover -s test-app -p test_server.py -v
-node --test test-app/test-recorder.cjs test-app/test-playback.cjs
+node --test test-app/test-recorder.cjs test-app/test-playback.cjs test-app/test-telephony.cjs
 ```
 
 Set `SAO_DENOISE_EXE` to the absolute newly built binary path before Python

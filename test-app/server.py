@@ -106,6 +106,7 @@ async def status(request: web.Request) -> web.Response:
         "ready": ready,
         "model": "DeepFilterNet3",
         "sample_rate": 48000,
+        "supported_sample_rates": [8000, 48000],
         "max_duration_seconds": MAX_SECONDS,
         "default_attenuation_db": 24,
         "demo_available": request.app[DEMO].is_file(),
@@ -123,21 +124,23 @@ async def demo(request: web.Request) -> web.Response:
     return web.FileResponse(request.app[DEMO], headers={"Content-Type": "audio/wav"})
 
 
-def validate_wav(data: bytes) -> int:
-    """Return the sample count after validating a bounded, complete PCM stream."""
+def validate_wav(data: bytes) -> tuple[int, int]:
+    """Return sample count and rate for a bounded, complete PCM stream."""
     try:
         with wave.open(io.BytesIO(data), "rb") as audio:
-            if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getcomptype()) != (1, 2, 48000, "NONE"):
-                raise ValueError("Expected mono 48 kHz PCM16 WAV. Reload the clip through this app.")
+            rate = audio.getframerate()
+            if ((audio.getnchannels(), audio.getsampwidth(), audio.getcomptype()) != (1, 2, "NONE")
+                    or rate not in (8000, 48000)):
+                raise ValueError("Expected mono 8 kHz or 48 kHz PCM16 WAV. Reload the clip through this app.")
             count = audio.getnframes()
-            if count > MAX_SECONDS * 48000:
+            if count > MAX_SECONDS * rate:
                 raise OverflowError("Choose a clip of 60 seconds or less.")
             if count < 1:
                 raise ValueError("The recording is empty. Record or choose a longer clip.")
             pcm = audio.readframes(count + 1)
             if len(pcm) != count * 2:
                 raise ValueError("The WAV is incomplete or contains a partial sample.")
-            return count
+            return count, rate
     except (wave.Error, EOFError) as exc:
         raise ValueError("This file is not a supported WAV recording.") from exc
 
@@ -163,7 +166,7 @@ async def enhance(request: web.Request) -> web.Response:
         except ConnectionResetError:
             return problem("The upload was interrupted. Try sending the recording again.", 400)
         try:
-            samples = validate_wav(data)
+            samples, sample_rate = validate_wav(data)
         except OverflowError as exc:
             return problem(str(exc), 413)
         except ValueError as exc:
@@ -195,14 +198,14 @@ async def enhance(request: web.Request) -> web.Response:
                     return problem("The Rust engine could not process this recording.", 500)
                 timing = json.loads(stderr.decode("utf-8").strip().splitlines()[-1])
                 output = target.read_bytes()
-                if validate_wav(output) != samples:
-                    return problem("The processed recording had an unexpected length.", 500)
+                if validate_wav(output) != (samples, sample_rate):
+                    return problem("The processed recording had an unexpected sample rate or length.", 500)
                 return web.Response(body=output, content_type="audio/wav", headers={
                     "Content-Disposition": 'inline; filename="sao-cleaned.wav"',
                     "X-Processing-Ms": f"{elapsed_ms:.3f}",
                     "X-Inference-Ms": f"{timing['processing_compute_seconds'] * 1000:.3f}",
                     "X-Real-Time-Factor": f"{timing['real_time_factor']:.6f}",
-                    "X-Audio-Duration": f"{samples / 48000:.6f}",
+                    "X-Audio-Duration": f"{samples / sample_rate:.6f}",
                 })
             except TimeoutError:
                 return problem("Processing took too long. Try a shorter clip.", 504)
