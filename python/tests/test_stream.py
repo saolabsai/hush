@@ -125,8 +125,8 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_or_ambiguous_rates_do_not_spawn(self):
         client = self.client()
         with patch("asyncio.create_subprocess_exec") as spawn:
-            for rate in (8, 16000, 44100, 8000.0, True, "8000"):
-                with self.subTest(rate=rate), self.assertRaisesRegex(ValueError, "8000 or 48000"):
+            for rate in (8, 22050, 44100, 8000.0, True, "8000"):
+                with self.subTest(rate=rate), self.assertRaisesRegex(ValueError, "8000, 16000 or 48000"):
                     await client.start(rate)
             spawn.assert_not_called()
 
@@ -180,7 +180,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "start"):
             await client.set_enabled(False)
         with self.assertRaisesRegex(ValueError, "48000"):
-            await client.start(16000)
+            await client.start(44100)
         await client.start()
         with self.assertRaisesRegex(RuntimeError, "already"):
             await client.start()

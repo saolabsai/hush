@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use sao_noise::{StreamDenoiser, SAMPLE_RATE, TELEPHONY_SAMPLE_RATE};
+use clap::{Args, Parser, Subcommand};
+use sao_noise::{StreamDenoiser, SAMPLE_RATE, TELEPHONY_SAMPLE_RATE, WIDEBAND_SAMPLE_RATE};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -23,12 +23,10 @@ enum Command {
     /// Exchange fixed-size mono PCM16 little-endian frames on stdin/stdout.
     /// Stdout starts with one JSON configuration line, followed by raw PCM.
     Stream {
-        #[arg(long, default_value = "24", value_parser = parse_attenuation)]
-        atten_lim_db: f32,
-        #[arg(long, default_value = "48000", value_parser = parse_sample_rate)]
-        sample_rate: u32,
+        #[command(flatten)]
+        options: ProcessingOptions,
     },
-    /// Denoise a mono PCM16 8 or 48 kHz WAV, preserving rate, length and alignment.
+    /// Denoise a mono PCM16 8, 16 or 48 kHz WAV, preserving rate, length and alignment.
     /// Existing output files are never overwritten.
     Wav {
         input: PathBuf,
@@ -41,19 +39,75 @@ enum Command {
     Benchmark {
         #[arg(long, default_value = "10", value_parser = parse_seconds)]
         seconds: f64,
-        #[arg(long, default_value = "24", value_parser = parse_attenuation)]
-        atten_lim_db: f32,
-        #[arg(long, default_value = "48000", value_parser = parse_sample_rate)]
-        sample_rate: u32,
+        #[command(flatten)]
+        options: ProcessingOptions,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallProfile {
+    PhoneCall,
+    VideoInterview,
+}
+
+impl CallProfile {
+    fn sample_rate(self) -> u32 {
+        match self {
+            Self::PhoneCall => TELEPHONY_SAMPLE_RATE,
+            Self::VideoInterview => SAMPLE_RATE,
+        }
+    }
+}
+
+#[derive(Args)]
+struct ProcessingOptions {
+    /// Configuration preset: phone_call (8 kHz) or video_interview (48 kHz).
+    #[arg(long, value_parser = parse_profile)]
+    profile: Option<CallProfile>,
+    /// Input/output rate: 8000, 16000 or 48000; overrides the profile rate.
+    #[arg(long, value_parser = parse_sample_rate)]
+    sample_rate: Option<u32>,
+    /// Suppression limit in dB; defaults to 24 for both profiles.
+    #[arg(long, value_parser = parse_attenuation)]
+    atten_lim_db: Option<f32>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ProcessingSettings {
+    sample_rate: u32,
+    atten_lim_db: f32,
+}
+
+impl ProcessingOptions {
+    fn resolve(&self) -> ProcessingSettings {
+        ProcessingSettings {
+            sample_rate: self.sample_rate.unwrap_or_else(|| {
+                self.profile
+                    .map(CallProfile::sample_rate)
+                    .unwrap_or(SAMPLE_RATE)
+            }),
+            atten_lim_db: self.atten_lim_db.unwrap_or(24.0),
+        }
+    }
+}
+
+fn parse_profile(value: &str) -> std::result::Result<CallProfile, String> {
+    match value {
+        "phone_call" => Ok(CallProfile::PhoneCall),
+        "video_interview" => Ok(CallProfile::VideoInterview),
+        _ => Err("profile must be phone_call or video_interview".into()),
+    }
 }
 
 fn parse_sample_rate(value: &str) -> std::result::Result<u32, String> {
     let rate = value
         .parse()
         .map_err(|_| "expected a sample rate".to_owned())?;
-    if !matches!(rate, TELEPHONY_SAMPLE_RATE | SAMPLE_RATE) {
-        return Err("supported sample rates are 8000 and 48000 Hz".into());
+    if !matches!(
+        rate,
+        TELEPHONY_SAMPLE_RATE | WIDEBAND_SAMPLE_RATE | SAMPLE_RATE
+    ) {
+        return Err("supported sample rates are 8000, 16000 and 48000 Hz".into());
     }
     Ok(rate)
 }
@@ -76,11 +130,9 @@ fn parse_seconds(value: &str) -> std::result::Result<f64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Stream {
-            atten_lim_db,
-            sample_rate,
-        } => {
-            let mut denoiser = StreamDenoiser::new(sample_rate, atten_lim_db)?;
+        Command::Stream { options } => {
+            let settings = options.resolve();
+            let mut denoiser = StreamDenoiser::new(settings.sample_rate, settings.atten_lim_db)?;
             let stdin = io::stdin();
             let stdout = io::stdout();
             stream(&mut stdin.lock(), &mut stdout.lock(), &mut denoiser)
@@ -90,11 +142,10 @@ fn main() -> Result<()> {
             output,
             atten_lim_db,
         } => wav(&input, &output, atten_lim_db),
-        Command::Benchmark {
-            seconds,
-            atten_lim_db,
-            sample_rate,
-        } => benchmark(seconds, atten_lim_db, sample_rate),
+        Command::Benchmark { seconds, options } => {
+            let settings = options.resolve();
+            benchmark(seconds, settings.atten_lim_db, settings.sample_rate)
+        }
     }
 }
 
@@ -183,12 +234,15 @@ fn encode_pcm16(samples: &[f32], output: &mut [u8]) -> Result<()> {
 
 fn validate_wav_spec(spec: hound::WavSpec) -> Result<()> {
     if spec.channels != 1
-        || !matches!(spec.sample_rate, TELEPHONY_SAMPLE_RATE | SAMPLE_RATE)
+        || !matches!(
+            spec.sample_rate,
+            TELEPHONY_SAMPLE_RATE | WIDEBAND_SAMPLE_RATE | SAMPLE_RATE
+        )
         || spec.sample_format != hound::SampleFormat::Int
         || spec.bits_per_sample != 16
     {
         bail!(
-            "expected mono PCM16 WAV at 8000 or 48000 Hz; got {} channel(s), {} Hz, {:?}, {} bits",
+            "expected mono PCM16 WAV at 8000, 16000 or 48000 Hz; got {} channel(s), {} Hz, {:?}, {} bits",
             spec.channels,
             spec.sample_rate,
             spec.sample_format,
@@ -460,12 +514,17 @@ mod tests {
         })
         .is_ok());
         assert!(validate_wav_spec(hound::WavSpec {
+            sample_rate: WIDEBAND_SAMPLE_RATE,
+            ..spec
+        })
+        .is_ok());
+        assert!(validate_wav_spec(hound::WavSpec {
             channels: 2,
             ..spec
         })
         .is_err());
         assert!(validate_wav_spec(hound::WavSpec {
-            sample_rate: 16000,
+            sample_rate: 11025,
             ..spec
         })
         .is_err());
@@ -482,11 +541,116 @@ mod tests {
     }
 
     #[test]
-    fn stream_rate_parser_accepts_telephone_and_full_band_only() {
+    fn stream_rate_parser_accepts_supported_pcm_rates_only() {
         assert_eq!(parse_sample_rate("8000").unwrap(), 8000);
+        assert_eq!(parse_sample_rate("16000").unwrap(), 16000);
         assert_eq!(parse_sample_rate("48000").unwrap(), 48000);
-        for invalid in ["8", "16000", "0", "NaN", "-8000", "8khz"] {
+        for invalid in ["8", "11025", "0", "NaN", "-8000", "8khz"] {
             assert!(parse_sample_rate(invalid).is_err());
         }
+    }
+
+    fn settings(arguments: &[&str]) -> ProcessingSettings {
+        let cli =
+            Cli::try_parse_from(std::iter::once("sao-denoise").chain(arguments.iter().copied()))
+                .unwrap();
+        match cli.command {
+            Command::Stream { options } | Command::Benchmark { options, .. } => options.resolve(),
+            Command::Wav { .. } => panic!("WAV input determines its own sample rate"),
+        }
+    }
+
+    #[test]
+    fn profiles_and_explicit_overrides_resolve_consistently() {
+        for command in ["stream", "benchmark"] {
+            assert_eq!(
+                settings(&[command]),
+                ProcessingSettings {
+                    sample_rate: 48_000,
+                    atten_lim_db: 24.0,
+                }
+            );
+            assert_eq!(
+                settings(&[command, "--profile", "phone_call"]),
+                ProcessingSettings {
+                    sample_rate: 8_000,
+                    atten_lim_db: 24.0,
+                }
+            );
+            assert_eq!(
+                settings(&[command, "--profile", "video_interview"]),
+                ProcessingSettings {
+                    sample_rate: 48_000,
+                    atten_lim_db: 24.0,
+                }
+            );
+            assert_eq!(
+                settings(&[
+                    command,
+                    "--profile",
+                    "phone_call",
+                    "--sample-rate",
+                    "16000",
+                    "--atten-lim-db",
+                    "12"
+                ]),
+                ProcessingSettings {
+                    sample_rate: 16_000,
+                    atten_lim_db: 12.0,
+                }
+            );
+            assert_eq!(
+                settings(&[
+                    command,
+                    "--sample-rate",
+                    "8000",
+                    "--atten-lim-db",
+                    "0",
+                    "--profile",
+                    "video_interview"
+                ]),
+                ProcessingSettings {
+                    sample_rate: 8_000,
+                    atten_lim_db: 0.0,
+                }
+            );
+        }
+        assert!(Cli::try_parse_from(["sao-denoise", "stream", "--profile", "unknown"]).is_err());
+        assert!(Cli::try_parse_from([
+            "sao-denoise",
+            "wav",
+            "input.wav",
+            "output.wav",
+            "--profile",
+            "phone_call"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rate_metadata_uses_interface_samples_and_preserves_full_band_header() -> Result<()> {
+        for (rate, delay) in [(8_000, 304), (16_000, 544), (48_000, 1_440)] {
+            let mut denoiser = StreamDenoiser::new(rate, 24.0)?;
+            let mut output = Vec::new();
+            stream(
+                &mut Cursor::new(Vec::<u8>::new()),
+                &mut output,
+                &mut denoiser,
+            )?;
+            let header: Value = serde_json::from_slice(&output)?;
+            assert_eq!(header["sample_rate"], rate);
+            assert_eq!(header["frame_samples"], rate / 100);
+            assert_eq!(header["algorithmic_delay_samples"], delay);
+            if rate == SAMPLE_RATE {
+                assert!(!header
+                    .as_object()
+                    .unwrap()
+                    .contains_key("model_sample_rate"));
+                assert_eq!(header.as_object().unwrap().len(), 5);
+            } else {
+                assert_eq!(header["model_sample_rate"], SAMPLE_RATE);
+            }
+        }
+        Ok(())
     }
 }

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import os
+
+from .config import HushConfig, SUPPORTED_SAMPLE_RATES as _SUPPORTED_SAMPLE_RATES
 
 
 class DenoiserError(RuntimeError):
@@ -24,7 +26,7 @@ class StreamInfo:
 
 
 class RustDenoiser:
-    """One native process and one audio timeline, for mono PCM16 LE at 8/48 kHz.
+    """One native process and one audio timeline, for mono PCM16 LE at 8/16/48 kHz.
 
     ``process`` buffers incomplete 10 ms hops. It exchanges up to four
     already available hops together, without waiting for additional input.
@@ -39,7 +41,7 @@ class RustDenoiser:
     """
 
     SAMPLE_RATE = 48_000
-    SUPPORTED_SAMPLE_RATES = (8_000, 48_000)
+    SUPPORTED_SAMPLE_RATES = _SUPPORTED_SAMPLE_RATES
     # Compatibility defaults; active framing is reported in stream_info.
     FRAME_SAMPLES = 480
     FRAME_BYTES = FRAME_SAMPLES * 2
@@ -49,7 +51,8 @@ class RustDenoiser:
         self,
         executable: str | os.PathLike[str] | Sequence[str] = "sao-denoise",
         *,
-        atten_lim_db: float = 24.0,
+        atten_lim_db: float | None = None,
+        config: HushConfig | None = None,
         startup_timeout: float = 60.0,
         response_timeout: float = 5.0,
         shutdown_timeout: float = 2.0,
@@ -60,8 +63,12 @@ class RustDenoiser:
             self._command = tuple(executable)
         if not self._command or any(not isinstance(p, str) or not p for p in self._command):
             raise ValueError("executable must be a path or a nonempty sequence of arguments")
-        if not math.isfinite(atten_lim_db) or not 0 <= atten_lim_db <= 100:
-            raise ValueError("atten_lim_db must be finite and between 0 and 100 dB")
+        if config is not None and not isinstance(config, HushConfig):
+            raise TypeError("config must be a HushConfig")
+        self._strict_sample_rate = config is not None
+        self._config = config if config is not None else HushConfig()
+        if atten_lim_db is not None:
+            self._config = replace(self._config, atten_lim_db=atten_lim_db)
         for name, value in (
             ("startup_timeout", startup_timeout),
             ("response_timeout", response_timeout),
@@ -69,7 +76,7 @@ class RustDenoiser:
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        self._atten_lim_db = atten_lim_db
+        self._atten_lim_db = self._config.atten_lim_db
         self._startup_timeout = startup_timeout
         self._response_timeout = response_timeout
         self._shutdown_timeout = shutdown_timeout
@@ -82,8 +89,13 @@ class RustDenoiser:
         self._pending_modes = bytearray()
         self._dry_delay = bytearray()
         self._mode_delay = bytearray()
-        self._enabled = True
+        self._enabled = self._config.enabled
         self._input_started = False
+
+    @property
+    def config(self) -> HushConfig:
+        """Validated startup defaults; stream_info reports the active native stream."""
+        return self._config
 
     @property
     def stream_info(self) -> StreamInfo | None:
@@ -103,14 +115,19 @@ class RustDenoiser:
         """Up to 8 KiB of native diagnostics, retained after shutdown."""
         return self._stderr_tail.decode("utf-8", errors="replace").strip()
 
-    async def start(self, sample_rate: int = SAMPLE_RATE) -> None:
+    async def start(self, sample_rate: int | None = None) -> None:
+        if sample_rate is None:
+            sample_rate = self._config.sample_rate
         if type(sample_rate) is not int or sample_rate not in self.SUPPORTED_SAMPLE_RATES:
-            raise ValueError("sao-noise requires mono PCM16 LE at 8000 or 48000 Hz")
+            raise ValueError("sao-noise requires mono PCM16 LE at 8000, 16000 or 48000 Hz")
+        if self._strict_sample_rate and sample_rate != self._config.sample_rate:
+            raise ValueError(f"transport sample rate {sample_rate} does not match configured sample_rate "
+                             f"{self._config.sample_rate}; use the same rate in Hush and the transport")
         async with self._lock:
             if self._process is not None:
                 raise RuntimeError("denoiser is already started; call stop() before restarting")
             self._stderr_tail.clear()
-            self._enabled = True
+            self._enabled = self._config.enabled
             self._input_started = False
             try:
                 async with asyncio.timeout(self._startup_timeout):
@@ -138,7 +155,7 @@ class RustDenoiser:
                     self._info = self._parse_header(header, sample_rate)
                     delay_bytes = self._info.algorithmic_delay_samples * 2
                     self._dry_delay = bytearray(delay_bytes)
-                    self._mode_delay = bytearray([1]) * delay_bytes
+                    self._mode_delay = bytearray([int(self._enabled)]) * delay_bytes
             except asyncio.CancelledError:
                 await self._cleanup_safely()
                 raise

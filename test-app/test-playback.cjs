@@ -39,7 +39,9 @@ function app() {
     Blob,
     URL: { createObjectURL: () => 'blob:local-test', revokeObjectURL() {} },
     cancelAnimationFrame() {}, requestAnimationFrame() {},
-    fetch: async () => ({ ok: true, json: async () => ({ ready: true, demo_available: true }) }),
+    fetch: async () => ({ ok: true, json: async () => ({ ready: true, demo_available: true,
+      profiles: { phone_call: { sample_rate: 8000, atten_lim_db: 24, enabled: true }, video_interview: { sample_rate: 48000, atten_lim_db: 24, enabled: true } },
+    }) }),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'static', 'app.js'), 'utf8'), context, { filename: 'app.js' });
   return { run: (code) => vm.runInContext(code, context), elements };

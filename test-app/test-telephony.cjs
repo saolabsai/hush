@@ -6,8 +6,18 @@ const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
 
-function app() {
+const catalog = {
+  ready: true, demo_available: true,
+  profiles: {
+    phone_call: { sample_rate: 8000, atten_lim_db: 24, enabled: true },
+    video_interview: { sample_rate: 48000, atten_lim_db: 24, enabled: true },
+  },
+};
+
+function app(options = {}) {
   const elements = new Map();
+  const rendered = [];
+  const copied = [];
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {
       value: id === 'attenuation' ? '24' : '', paused: true, currentTime: 0,
@@ -22,13 +32,29 @@ function app() {
   const context = vm.createContext({
     document: { getElementById: element },
     window: { devicePixelRatio: 1, addEventListener() {} },
+    navigator: { clipboard: { writeText: async (text) => copied.push(text) } },
     Blob,
     URL: { createObjectURL: () => 'blob:telephony-test', revokeObjectURL() {} },
     cancelAnimationFrame() {}, requestAnimationFrame() {},
-    fetch: async () => ({ ok: true, json: async () => ({ ready: true, demo_available: true }) }),
+    fetch: options.fetch || (async () => ({ ok: true, json: async () => catalog })),
   });
+  if (options.resample) context.window.OfflineAudioContext = class {
+    constructor(channels, length, sampleRate) { this.length = length; this.sampleRate = sampleRate; }
+    createBuffer(channels, length, sampleRate) {
+      return { length, sampleRate, copyToChannel: (samples) => { this.samples = samples.slice(); } };
+    }
+    createBufferSource() {
+      const source = { connect() {}, start: () => { this.source = source.buffer; } };
+      return source;
+    }
+    async startRendering() {
+      rendered.push({ inputRate: this.source.sampleRate, inputFrames: this.source.length, outputRate: this.sampleRate, outputFrames: this.length });
+      if (options.renderGate) await options.renderGate;
+      return { getChannelData: () => new Float32Array(this.length).fill(0.125) };
+    }
+  };
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'static', 'app.js'), 'utf8'), context, { filename: 'app.js' });
-  return { context, elements, run: (code) => vm.runInContext(code, context) };
+  return { context, elements, rendered, copied, run: (code) => vm.runInContext(code, context) };
 }
 
 function chunk(name, bytes) {
@@ -91,16 +117,19 @@ test('duration limits are based on 8 kHz samples and empty clips are rejected', 
 
 test('other rates and channel formats retain the existing browser conversion path', () => {
   const { context, run } = app();
-  for (const options of [{ rate: 16000 }, { channels: 2 }, { bits: 8 }, { codec: 3 }]) {
+  for (const options of [{ rate: 44100 }, { channels: 2 }, { bits: 8 }, { codec: 3 }]) {
     context.payload = arrayBuffer(wav([1, -1], options));
     assert.equal(run('parseNativeWav(payload)'), null);
   }
   context.payload = arrayBuffer(wav([1], { rate: 48000 }));
   assert.equal(run('parseNativeWav(payload).sampleRate'), 48000);
+  context.payload = arrayBuffer(wav([1], { rate: 16000 }));
+  assert.equal(run('parseNativeWav(payload).sampleRate'), 16000);
 });
 
 test('uploading native phone PCM retains its blob and duration without browser resampling', async () => {
   const { context, elements, run } = app();
+  await run('initialized');
   const bytes = wav(new Int16Array(160).fill(1024));
   context.phoneFile = { name: 'phone.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
   await run('loadAudio(phoneFile)');
@@ -112,6 +141,7 @@ test('uploading native phone PCM retains its blob and duration without browser r
 
 test('a malformed phone upload leaves the prior source available', async () => {
   const { context, elements, run } = app();
+  await run('initialized');
   run("setSource(new Float32Array(480), 'prior.wav', 'uploaded clip')");
   const bytes = wav([1, -1]).subarray(0, -1);
   context.phoneFile = { name: 'broken.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
@@ -119,4 +149,107 @@ test('a malformed phone upload leaves the prior source available', async () => {
   assert.equal(run('state.source.name'), 'prior.wav');
   assert.equal(elements.get('error-message').hidden, false);
   assert.match(elements.get('error-message').textContent, /incomplete/);
+});
+
+test('profiles come from the server catalog and precise overrides produce copyable settings', async () => {
+  const { run, elements, copied } = app();
+  await run('initialized');
+  assert.deepEqual(JSON.parse(elements.get('config-preview').textContent), catalog.profiles.phone_call);
+  elements.get('profile').value = 'video_interview';
+  await run('applyProfile()');
+  assert.equal(elements.get('sample-rate').value, '48000');
+  elements.get('sample-rate').value = '16000';
+  elements.get('attenuation-number').value = '37.25';
+  elements.get('enabled').checked = false;
+  await run('changeSettings()');
+  await run('copyConfiguration()');
+  assert.deepEqual(JSON.parse(copied[0]), { sample_rate: 16000, atten_lim_db: 37.25, enabled: false });
+  elements.get('profile').value = 'phone_call';
+  await run('applyProfile()');
+  assert.deepEqual(JSON.parse(elements.get('config-preview').textContent), catalog.profiles.phone_call);
+});
+
+test('rate overrides render the cached original at the actual target rate without chained conversion', async () => {
+  const { context, run, elements, rendered } = app({ resample: true });
+  await run('initialized');
+  const bytes = wav(new Int16Array(4800).fill(1024), { rate: 48000 });
+  context.sourceFile = { name: 'video.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
+  await run('loadAudio(sourceFile)');
+  let prepared = Buffer.from(await run('state.source.blob.arrayBuffer()'));
+  assert.equal(prepared.readUInt32LE(24), 8000);
+  assert.equal(prepared.readUInt32LE(40), 800 * 2);
+  assert.equal(run('state.source.duration'), 0.1);
+  run('state.result = { attenuation: 24 };');
+  elements.get('sample-rate').value = '16000';
+  await run('changeSettings()');
+  prepared = Buffer.from(await run('state.source.blob.arrayBuffer()'));
+  assert.equal(prepared.readUInt32LE(24), 16000);
+  assert.equal(prepared.readUInt32LE(40), 1600 * 2);
+  assert.equal(run('state.result'), null);
+  assert.deepEqual(rendered, [
+    { inputRate: 48000, inputFrames: 4800, outputRate: 8000, outputFrames: 800 },
+    { inputRate: 48000, inputFrames: 4800, outputRate: 16000, outputFrames: 1600 },
+  ]);
+  elements.get('sample-rate').value = '48000';
+  await run('changeSettings()');
+  assert.deepEqual(Buffer.from(await run('state.source.blob.arrayBuffer()')), bytes);
+  assert.equal(rendered.length, 2);
+});
+
+test('busy conversion disables settings until the prepared PCM matches the selection', async () => {
+  let release;
+  const renderGate = new Promise((resolve) => { release = resolve; });
+  const { context, run, elements } = app({ resample: true, renderGate });
+  await run('initialized');
+  const bytes = wav(new Int16Array(160).fill(1024));
+  context.sourceFile = { name: 'phone.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
+  await run('loadAudio(sourceFile)');
+  elements.get('sample-rate').value = '16000';
+  const changing = run('changeSettings()');
+  for (const name of ['profile', 'sample-rate', 'enabled', 'attenuation', 'attenuation-number', 'enhance-button']) assert.equal(elements.get(name).disabled, true, name);
+  assert.equal(run('state.source.sampleRate'), 8000);
+  release(); await changing;
+  assert.equal(run('state.source.sampleRate'), 16000);
+  assert.equal(elements.get('enhance-button').disabled, false);
+});
+
+test('strength and enable changes clear stale results while invalid values block processing', async () => {
+  const { context, run, elements } = app();
+  await run('initialized');
+  const bytes = wav(new Int16Array(160).fill(1024));
+  context.sourceFile = { name: 'phone.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
+  await run('loadAudio(sourceFile)');
+  run('state.result = { attenuation: 24 };');
+  elements.get('attenuation-number').value = '92.5';
+  elements.get('enabled').checked = false;
+  await run('changeSettings()');
+  assert.equal(run('state.result'), null);
+  assert.equal(JSON.parse(elements.get('config-preview').textContent).atten_lim_db, 92.5);
+  for (const invalid of ['', '-1', '101', 'NaN']) {
+    elements.get('attenuation-number').value = invalid;
+    await run('changeSettings()');
+    assert.equal(elements.get('enhance-button').disabled, true);
+    assert.equal(elements.get('copy-config').disabled, true);
+  }
+});
+
+test('disabled processing sends explicit bypass and retains the configured strength', async () => {
+  const calls = [];
+  const { context, run, elements } = app({ fetch: async (url, options) => {
+    if (url === '/api/status') return { ok: true, json: async () => catalog };
+    calls.push({ url, body: options.body });
+    return { ok: false, json: async () => ({ error: 'test request captured' }) };
+  } });
+  await run('initialized');
+  const bytes = wav(new Int16Array(160).fill(1024));
+  context.sourceFile = { name: 'phone.wav', size: bytes.length, arrayBuffer: async () => arrayBuffer(bytes) };
+  await run('loadAudio(sourceFile)');
+  elements.get('attenuation-number').value = '73.5';
+  elements.get('enabled').checked = false;
+  await run('changeSettings()');
+  await run('enhance()');
+  assert.match(calls[0].url, /attenuation=73\.5&enabled=false&sample_rate=8000$/);
+  assert.deepEqual(Buffer.from(await calls[0].body.arrayBuffer()), bytes);
+  assert.equal(elements.get('attenuation-number').value, '73.5');
+  assert.equal(JSON.parse(elements.get('config-preview').textContent).enabled, false);
 });
