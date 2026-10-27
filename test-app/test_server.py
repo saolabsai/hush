@@ -287,6 +287,9 @@ class NativeApiTests(_ApiClient):
         self.assertEqual(metadata, (1, 2, 8000))
         self.assertEqual(count, len(samples))
         self.assertTrue(any(cleaned[-13:]), "8 kHz partial final hop was lost")
+        self.assertLess(sum(value * value for value in cleaned),
+                        sum(value * value for value in samples),
+                        "default enhancement did not reduce this 8 kHz noise-only fixture")
         self.assertAlmostEqual(float(response.headers["X-Audio-Duration"]), len(samples) / 8000, places=6)
 
     async def test_phone_zero_attenuation_keeps_exact_pcm_and_alignment(self):
