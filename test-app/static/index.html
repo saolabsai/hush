@@ -41,7 +41,7 @@
           <p class="input-note">Profiles provide starting values, not tuned quality settings. Change any value for your audio.</p>
           <label class="enabled-setting"><input type="checkbox" id="enabled" checked disabled><span>Enable noise reduction</span></label>
           <div class="slider-heading"><label for="attenuation">Noise reduction limit</label><output id="attenuation-value" for="attenuation">24 dB</output></div>
-          <input type="range" min="0" max="100" value="24" step="1" id="attenuation" aria-describedby="attenuation-help" disabled>
+          <input type="range" min="0" max="100" value="24" step="any" id="attenuation" aria-describedby="attenuation-help" disabled>
           <div class="slider-scale" aria-hidden="true"><span>Light touch</span><span>More reduction</span></div>
           <label class="exact-value" for="attenuation-number">Exact limit <span><input type="number" min="0" max="100" value="24" step="any" id="attenuation-number" disabled> dB</span></label>
           <p id="attenuation-help" class="input-note">Higher values allow stronger noise removal. Listen for the balance that keeps your voice natural.</p>

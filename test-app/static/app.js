@@ -503,7 +503,7 @@ ui['record-button'].addEventListener('click', () => state.mode === 'recording' ?
 ui.profile.addEventListener('change', applyProfile);
 ui['sample-rate'].addEventListener('change', changeSettings);
 ui.enabled.addEventListener('change', changeSettings);
-ui.attenuation.addEventListener('input', () => { ui['attenuation-number'].value = ui.attenuation.value; changeSettings(); });
+ui.attenuation.addEventListener('input', () => { ui.attenuation.value = String(Math.round(Number(ui.attenuation.value) * 10) / 10); ui['attenuation-number'].value = ui.attenuation.value; changeSettings(); });
 ui['attenuation-number'].addEventListener('input', () => { if (ui['attenuation-number'].value.trim()) ui.attenuation.value = ui['attenuation-number'].value; changeSettings(); });
 ui['copy-config'].addEventListener('click', copyConfiguration);
 ui['switch-original'].addEventListener('click', () => switchPlayback(ui['original-player']));
