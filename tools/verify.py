@@ -72,7 +72,8 @@ def main():
         environment["SAO_DENOISE_EXE"] = str(binary)
         for suite in ("python", "lab"):
             run(suite, [sys.executable, ROOT / "tools/run_tests.py", suite], timeout=180)
-        run("browser", [node, "--test", "test-app/test-recorder.cjs", "test-app/test-playback.cjs"], timeout=60)
+        run("browser", [node, "--test", "test-app/test-recorder.cjs", "test-app/test-playback.cjs",
+                              "test-app/test-live.cjs"], timeout=60)
         report["passed"] = True
     except (ImportError, ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         report["error"] = str(error)

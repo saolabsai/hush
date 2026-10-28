@@ -1,7 +1,9 @@
 # Hush Lab
 
 A local browser bench for recording, processing and comparing audio with the
-Rust DeepFilterNet3 engine. This is a clip-based lab, not a live virtual microphone.
+Rust DeepFilterNet3 engine. The main page works on clips; the
+[live comparison](#live-comparison) streams your microphone. Neither is a
+virtual microphone for other apps.
 
 ## Start
 
@@ -42,6 +44,32 @@ includes startup; native inference timing excludes capture/network. There is
 one enhancement request at a time. No acoustic echo cancellation or isolation
 of an individual person from overlapping voices is provided.
 
+## Live comparison
+
+Open [Hush Live](http://127.0.0.1:8765/live.html) to hear noise reduction while
+you speak. The page streams the microphone to the local server, which returns
+three versions of the same moment:
+
+- **Original**: the raw microphone, with the browser's noise suppression, echo
+  cancellation and gain control requested off.
+- **RNNoise**: Pipecat's `RNNoiseFilter`, a common filter in Pipecat voice bots.
+  Install it with `python -m pip install "pipecat-ai[rnnoise]==1.12.0"`; without
+  it the page compares the original with Hush only.
+- **Hush**: DeepFilterNet3 through the `sao_noise` client, so install `./python`
+  in the same environment.
+
+Put on headphones, turn on playback, then switch versions with the cards or the
+1, 2 and 3 keys while you talk. Original and RNNoise are delayed to Hush's 30 ms,
+so a switch lands at the same moment. Each card shows the background level (the
+quietest tenth of the last 10 seconds), the voice level (the loudest twentieth),
+the background removed compared with the original, and the filter's measured
+compute per 10 ms of audio. These are loudness estimates, not speech quality
+scores. After stopping, download the last two minutes of each version as
+time-aligned WAVs.
+
+One live test runs at a time, for up to 10 minutes. The server holds audio only
+while processing it; the downloads are built in the browser.
+
 ## Data and hosting
 
 Audio uploads only when you select **Clean up audio**. With the default loopback
@@ -65,7 +93,7 @@ remotely, audio is sent to that server and passes through your proxy provider.
 
 ```console
 python -m unittest discover -s test-app -p test_server.py -v
-node --test test-app/test-recorder.cjs test-app/test-playback.cjs
+node --test test-app/test-recorder.cjs test-app/test-playback.cjs test-app/test-live.cjs
 ```
 
 Set `SAO_DENOISE_EXE` to the built absolute binary path. Native checks require

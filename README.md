@@ -37,6 +37,10 @@ or use the generated sample, then compare original and cleaned audio. The
 sample is an artificial voiced waveform with seeded noise, **not intelligible
 speech or a quality benchmark**. No voice recordings are bundled.
 
+[Hush Live](http://127.0.0.1:8765/live.html) compares the original microphone,
+RNNoise and Hush while you speak, switching between them at the same moment.
+See the [lab guide](test-app/README.md#live-comparison) for its requirements.
+
 The lab finds `target/release/sao-denoise` (`.exe` on Windows). Override it with
 `--executable /absolute/path/to/sao-denoise`. See the
 [lab guide](test-app/README.md) for privacy, HTTPS and verification details.
@@ -106,7 +110,7 @@ cargo fmt -- --check
 cargo test --release --locked
 python -m unittest discover -s python/tests -v
 python -m unittest discover -s test-app -p test_server.py -v
-node --test test-app/test-recorder.cjs test-app/test-playback.cjs
+node --test test-app/test-recorder.cjs test-app/test-playback.cjs test-app/test-live.cjs
 ```
 
 Set `SAO_DENOISE_EXE` to the absolute newly built binary path before Python

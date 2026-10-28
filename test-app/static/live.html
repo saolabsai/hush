@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f2ed">
+  <title>Hush Live</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/live.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Hush Lab home"><span class="brand-symbol" aria-hidden="true">sao<span>°</span></span><span class="brand-divider"></span><span class="brand-name">HUSH LAB</span></a>
+      <nav class="lab-nav" aria-label="Lab pages"><a href="/">Clip test</a><a href="/live.html" aria-current="page">Live comparison</a></nav>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <div><p class="eyebrow">THE LIVE ROOM <span>/ 02</span></p><h1 id="page-title">Hear it as you speak.<br><span>Original, RNNoise, Hush.</span></h1><p class="intro-copy">Talk with real background noise around you and switch what you hear without stopping.<br>Every version is the same moment, processed on this computer.</p></div>
+      </section>
+
+      <div class="engine-strip"><span class="engine-name"><span class="status-dot" id="engine-dot"></span><span id="engine-status">Connecting to the engine…</span></span><span class="engine-spec">Hush DeepFilterNet3 <span>·</span> RNNoise from Pipecat <span>·</span> 48 kHz live</span></div>
+      <div id="error-message" class="error-message" role="alert" hidden></div>
+
+      <section class="workspace" aria-label="Live noise reduction comparison">
+        <section class="source-panel" aria-labelledby="start-heading">
+          <div class="section-heading"><span class="step-number">01</span><h2 id="start-heading">Open the microphone</h2></div>
+          <p class="section-description">Your browser's own noise suppression, echo cancellation and gain control are turned off, so each version starts from the same raw sound.</p>
+          <button type="button" class="record-button" id="live-button" disabled><span class="mic-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M6 11v1a6 6 0 0 0 12 0v-1M12 18v3M9 21h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span><span><strong id="live-label">Start live test</strong><span id="live-hint">Up to 10 minutes · nothing is stored on the server</span></span><span class="record-action" id="live-action" aria-hidden="true">↗</span></button>
+          <label class="listen-toggle"><input type="checkbox" id="listen" disabled><span><strong>Play to my headphones</strong><span>Leave this off with speakers: the microphone would hear them.</span></span></label>
+
+          <div class="section-heading tuning-heading"><span class="step-number">02</span><h2>Hush strength</h2></div>
+          <div class="slider-heading"><label for="attenuation">Noise reduction limit</label><output id="attenuation-value" for="attenuation">24 dB</output></div>
+          <input type="range" min="0" max="60" value="24" step="1" id="attenuation" aria-describedby="attenuation-help" disabled>
+          <div class="slider-scale" aria-hidden="true"><span>Light touch</span><span>More reduction</span></div>
+          <p id="attenuation-help" class="input-note">Applies when the test starts. RNNoise has no strength setting.</p>
+          <p id="activity" class="activity" role="status" aria-live="polite">Checking the engine…</p>
+        </section>
+
+        <section class="listen-panel" aria-labelledby="versions-heading">
+          <div class="listening-top"><div class="section-heading"><span class="step-number">03</span><h2 id="versions-heading">Switch what you hear</h2></div><span class="headphones-note">Keys 1, 2 and 3 switch</span></div>
+          <div class="versions" role="group" aria-label="Version to hear">
+            <button type="button" class="version-card" id="version-original" data-version="original" aria-pressed="false" disabled><span class="version-top"><span class="track-label">1 / ORIGINAL</span><span class="version-delay" id="delay-original">0 ms</span></span><h3>Room and all</h3><span class="level-track"><span class="level-fill" id="level-original"></span></span><dl><div><dt>Background</dt><dd id="floor-original">—</dd></div><div><dt>Voice</dt><dd id="voice-original">—</dd></div><div><dt>Noise removed</dt><dd>—</dd></div><div><dt>Compute / 10 ms</dt><dd>—</dd></div></dl></button>
+            <button type="button" class="version-card" id="version-rnnoise" data-version="rnnoise" aria-pressed="false" disabled><span class="version-top"><span class="track-label">2 / RNNOISE</span><span class="version-delay" id="delay-rnnoise">—</span></span><h3>Pipecat's RNNoise filter</h3><span class="level-track"><span class="level-fill" id="level-rnnoise"></span></span><dl><div><dt>Background</dt><dd id="floor-rnnoise">—</dd></div><div><dt>Voice</dt><dd id="voice-rnnoise">—</dd></div><div><dt>Noise removed</dt><dd id="removed-rnnoise">—</dd></div><div><dt>Compute / 10 ms</dt><dd id="compute-rnnoise">—</dd></div></dl></button>
+            <button type="button" class="version-card" id="version-hush" data-version="hush" aria-pressed="false" disabled><span class="version-top"><span class="track-label">3 / HUSH</span><span class="version-delay" id="delay-hush">—</span></span><h3>DeepFilterNet3 in Rust</h3><span class="level-track"><span class="level-fill" id="level-hush"></span></span><dl><div><dt>Background</dt><dd id="floor-hush">—</dd></div><div><dt>Voice</dt><dd id="voice-hush">—</dd></div><div><dt>Noise removed</dt><dd id="removed-hush">—</dd></div><div><dt>Compute / 10 ms</dt><dd id="compute-hush">—</dd></div></dl></button>
+          </div>
+          <article class="audio-card level-card"><div class="audio-card-heading"><div><span class="track-label">LEVELS / LAST 10 SECONDS</span><h3>Quiet moments show the noise left.</h3></div><span class="chart-key"><span class="key-original">Original</span><span class="key-rnnoise">RNNoise</span><span class="key-hush">Hush</span></span></div><div class="chart-container"><canvas id="level-chart" aria-label="Loudness of each version over the last 10 seconds" role="img"></canvas></div></article>
+          <div class="comparison-actions"><span class="download-label">Last 2 minutes, time-aligned</span><a id="download-original" class="download-link" aria-disabled="true">Original WAV</a><a id="download-rnnoise" class="download-link" aria-disabled="true">RNNoise WAV</a><a id="download-hush" class="download-link" aria-disabled="true">Hush WAV</a></div>
+          <p class="metrics-note">Background is the level of the quietest tenth of the last 10 seconds, and voice the loudest twentieth. Noise removed compares each background with the original's. These come from loudness, not a speech quality score: listen as well. Every version plays 30 ms late, Hush's delay, so a switch lands at the same moment.</p>
+        </section>
+      </section>
+      <footer><span>SAO <span class="footer-slash">/</span> EXPERIMENTS IN CLEARER CONVERSATION</span><span>Hush DeepFilterNet3 <span class="footer-dot">·</span> RNNoise baseline <span class="footer-dot">·</span> A live listening test</span></footer>
+    </main>
+  </div>
+</body>
+</html>
